@@ -1,0 +1,102 @@
+name: Build and upload release artifacts
+
+on:
+    push:
+        tags:
+            - 'v*'
+    workflow_dispatch: {}
+
+jobs:
+    build-linux:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache cargo registry
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cargo/registry
+                  key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+                  profile: minimal
+                  override: true
+
+            - name: Install system dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y pkg-config libdbus-1-dev
+
+            - name: Build release
+              run: cargo build --release
+
+            - name: Install cargo-deb
+              run: cargo install cargo-deb --locked
+
+            - name: Build .deb package
+              run: cargo deb --no-build
+
+            - name: Install fpm for RPM
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y ruby ruby-dev build-essential rpm
+                  sudo gem install --no-document fpm
+
+            - name: Build .rpm package
+              run: |
+                  VERSION=${{ github.ref_name || github.sha }}
+                  mkdir -p pkg
+                  fpm -s dir -t rpm -n ear-native -v "$VERSION" --prefix /usr/local -C ./ ./target/release/ear-native=/usr/local/bin/ear-native
+                  pushd target/release
+                  fpm -s dir -t rpm -n ear-native -v "$VERSION" --prefix /usr/local ./ear-native=/usr/local/bin/ear-native
+                  mv *.rpm ../../pkg/ || true
+                  popd
+
+            - name: Package AppImage (minimal)
+              run: |
+                  set -e
+                  sudo apt-get update
+                  sudo apt-get install -y libfuse2 wget
+                  APPDIR=AppDir
+                  mkdir -p "$APPDIR"/usr/bin
+                  cp target/release/ear-native "$APPDIR"/usr/bin/
+                  printf '%s\n' '[Desktop Entry]' 'Name=ear-native' 'Exec=ear-native' 'Icon=ear-native' 'Type=Application' 'Categories=Utility;' > "$APPDIR"/ear-native.desktop
+                  mkdir -p "$APPDIR"/usr/share/applications
+                  cp "$APPDIR"/ear-native.desktop "$APPDIR"/usr/share/applications/
+                  wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+                  chmod +x appimagetool.AppImage
+                  ./appimagetool.AppImage "$APPDIR" || true
+
+            - name: Upload Linux artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-artifacts
+                  path: |
+                      target/release/ear-native
+                      target/debian/*.deb
+                      pkg/*.rpm
+                      *.AppImage
+
+    build-windows:
+        runs-on: windows-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  toolchain: stable
+                  profile: minimal
+                  override: true
+
+            - name: Build release (MSVC)
+              run: cargo build --release
+
+            - name: Upload Windows exe
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-artifact
+                  path: target/release/ear-native.exe
