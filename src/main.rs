@@ -1,7 +1,7 @@
 ﻿use futures::{channel::mpsc::Sender, SinkExt};
 use iced::{
-    mouse, time,
-    widget::{button, column, container, image, mouse_area, row, scrollable, text, Space},
+    time,
+    widget::{button, column, container, image, row, scrollable, text},
     Alignment, Border, Color, Element, Font, Length, Padding, Subscription, Task, Theme,
 };
 
@@ -10,15 +10,24 @@ use tokio::sync::mpsc;
 
 mod app;
 mod bluetooth;
+mod components;
+mod config;
 mod models;
 mod protocol;
 mod ui;
 
-use bluetooth::{BluetoothEvent, BluetoothManager, ManagerCommand};
-use models::{embedded_image_handle, get_models, get_sku_map, preload_model_images, ModelInfo};
+use bluetooth::{
+    create_adapter, BluetoothEvent, BluetoothManager, DiscoveredDevice, ManagerCommand,
+};
+use components::{anc, battery, equalizer};
+use config::AppConfig;
+use models::{
+    embedded_image_handle, get_models, get_sku_map, preload_model_images_in_background, ModelInfo,
+};
 use protocol::Packet;
 use ui::{
-    btn_style_active, btn_style_default, btn_style_red, BORDER_GREY, GREY, PURE_BLACK, PURE_WHITE,
+    app_font, btn_style_active, btn_style_default, btn_style_red, APP_FONT_NAME, BORDER_GREY, GREY,
+    PURE_BLACK, PURE_WHITE,
 };
 
 use std::time::{Duration, Instant};
@@ -33,6 +42,8 @@ use crate::{
 struct EarNative {
     models: HashMap<String, ModelInfo>,
     sku_map: HashMap<String, String>,
+    config: AppConfig,
+    last_auto_connect_at: Option<Instant>,
     active_model_assets_ready: bool,
     state: AppState,
     discovered_devices: Vec<(String, String)>,
@@ -109,6 +120,8 @@ pub fn main() -> iced::Result {
     iced::application(EarNative::boot, EarNative::update, EarNative::view)
         .theme(EarNative::theme)
         .subscription(EarNative::subscription)
+        .font(include_bytes!("../res/fonts/Silkscreen-Regular.ttf").as_slice())
+        .default_font(Font::with_name(APP_FONT_NAME))
         .window(settings)
         .run()
 }
@@ -118,6 +131,8 @@ impl Default for EarNative {
         Self {
             models: get_models(),
             sku_map: get_sku_map(),
+            config: AppConfig::default(),
+            last_auto_connect_at: None,
             active_model_assets_ready: true,
             state: AppState::Disconnected,
             discovered_devices: Vec::new(),
@@ -133,7 +148,13 @@ impl Default for EarNative {
 
 impl EarNative {
     fn boot() -> (Self, Task<Message>) {
-        (Self::default(), Task::none())
+        (
+            Self::default(),
+            Task::perform(
+                async { AppConfig::load_or_default() },
+                Message::ConfigLoaded,
+            ),
+        )
     }
 
     fn eq_command_for_model(model: &ModelInfo) -> crate::protocol::PacketCommand {
@@ -166,67 +187,6 @@ impl EarNative {
 
     fn supports_split_ring(model: &ModelInfo) -> bool {
         model.base != "B181" && !model.left_img.is_empty() && !model.right_img.is_empty()
-    }
-
-    fn custom_eq_active(model: &ModelInfo, eq_preset: u8, advanced_eq_enabled: bool) -> bool {
-        if matches!(model.base.as_str(), "B172" | "B168") {
-            eq_preset == 6
-        } else {
-            eq_preset == 5 && !advanced_eq_enabled
-        }
-    }
-
-    fn eq_button_active(
-        model: &ModelInfo,
-        preset: u8,
-        eq_preset: u8,
-        advanced_eq_enabled: bool,
-    ) -> bool {
-        if EarNative::supports_advanced_eq(model) && preset == 6 {
-            advanced_eq_enabled
-        } else {
-            !advanced_eq_enabled && preset == eq_preset
-        }
-    }
-
-    fn eq_presets(model: &ModelInfo) -> Vec<(u8, &'static str)> {
-        match model.base.as_str() {
-            "B172" | "B168" => vec![
-                (0, "dirac opteo"),
-                (3, "pop"),
-                (1, "rock"),
-                (5, "classical"),
-                (2, "electronic"),
-                (4, "enhance vocals"),
-                (6, "custom"),
-            ],
-            "B155" | "B157" | "B171" | "B174" => vec![
-                (0, "balanced"),
-                (3, "more bass"),
-                (2, "more treble"),
-                (1, "voice"),
-                (5, "custom"),
-                (6, "advanced"),
-            ],
-            _ => vec![
-                (0, "balanced"),
-                (3, "more bass"),
-                (2, "more treble"),
-                (1, "voice"),
-                (5, "custom"),
-            ],
-        }
-    }
-
-    fn anc_strength_options(model: &ModelInfo) -> Vec<(u8, &'static str)> {
-        match model.base.as_str() {
-            "B181" => vec![(4, "high"), (3, "low")],
-            "B163" => vec![(4, "high"), (5, "mid"), (3, "low")],
-            "B155" | "B171" | "B162" | "B172" => {
-                vec![(4, "high"), (5, "mid"), (3, "low"), (6, "adaptive")]
-            }
-            _ => vec![],
-        }
     }
 
     fn matched_model_key(&self, device_name: &str) -> Option<&str> {
@@ -333,6 +293,14 @@ impl EarNative {
             Message::ActiveModelAssetsPreloaded => {
                 self.active_model_assets_ready = true;
             }
+            Message::ConfigLoaded(config) => {
+                self.config = config;
+            }
+            Message::ConfigPersisted(result) => {
+                if let Err(error) = result {
+                    log::error!("failed to persist config: {}", error);
+                }
+            }
             Message::Ready(tx) => self.cmd_tx = Some(tx),
             Message::LoadingTick => {
                 self.loading_frame = (self.loading_frame + 1) % 4;
@@ -341,9 +309,30 @@ impl EarNative {
                 self.initial_data_load = None;
             }
             Message::Bluetooth(event) => match event {
-                BluetoothEvent::DeviceDiscovered(addr, name) => {
-                    if !self.discovered_devices.iter().any(|(a, _)| a == &addr) {
-                        self.discovered_devices.push((addr, name));
+                BluetoothEvent::DeviceDiscovered(device) => {
+                    let mut tasks = Vec::new();
+
+                    if let Some(existing) = self
+                        .discovered_devices
+                        .iter_mut()
+                        .find(|(addr, _)| addr == &device.id)
+                    {
+                        existing.1 = device.name.clone();
+                    } else {
+                        self.discovered_devices
+                            .push((device.id.clone(), device.name.clone()));
+                    }
+
+                    if self.config.remember_device_name(&device.id, &device.name) {
+                        tasks.push(self.persist_config());
+                    }
+
+                    if let Some(task) = self.maybe_auto_connect(&device) {
+                        tasks.push(task);
+                    }
+
+                    if !tasks.is_empty() {
+                        return Task::batch(tasks);
                     }
                 }
                 BluetoothEvent::Error(err) => {
@@ -370,10 +359,16 @@ impl EarNative {
                     self.initial_data_load = None;
                     self.loading_frame = 0;
 
+                    let mut tasks = Vec::new();
+                    if self.config.remember_connected_device(&addr) {
+                        tasks.push(self.persist_config());
+                    }
+
                     let initial_model_key = self.inferred_model_key(&name);
                     let initial_model = self.models.get(&initial_model_key).unwrap().clone();
 
                     self.connected_device = Some(ConnectedDevice {
+                        id: addr.clone(),
                         model: initial_model,
                         battery_left: None,
                         sku_attempts: 0,
@@ -397,12 +392,34 @@ impl EarNative {
                         ear_tip_test_running: false,
                     });
 
-                    return Task::batch(vec![
+                    if let Some(cached_model_key) = self.config.known_model_key(&addr) {
+                        if let Some(cached_model) = self.models.get(cached_model_key).cloned() {
+                            log::info!(
+                                "Using cached model for {}: {} ({})",
+                                addr,
+                                cached_model.name,
+                                cached_model.base
+                            );
+
+                            tasks.push(self.start_initial_data_load(cached_model));
+                            tasks.push(self.send_delayed_command(
+                                PacketCommand::ReadFirmware,
+                                vec![],
+                                1700,
+                            ));
+
+                            return Task::batch(tasks);
+                        }
+                    }
+
+                    tasks.extend(vec![
                         self.send_delayed_command(PacketCommand::ReadSku, vec![], 100),
                         self.send_delayed_command(PacketCommand::ReadSkuAlt, vec![], 300),
                         self.send_delayed_command(PacketCommand::RespSku, vec![], 500),
                         self.send_delayed_command(PacketCommand::ReadFirmware, vec![], 700),
                     ]);
+
+                    return Task::batch(tasks);
                 }
                 BluetoothEvent::Disconnected => {
                     self.state = AppState::Disconnected;
@@ -415,6 +432,7 @@ impl EarNative {
                 BluetoothEvent::PacketReceived(packet) => return self.handle_packet(packet),
             },
             Message::Connect(addr) => {
+                log::info!("Manual connect requested for {}", addr);
                 self.state = AppState::Connecting("initializing".to_string());
                 self.active_model_assets_ready = true;
                 self.loading_frame = 0;
@@ -431,7 +449,13 @@ impl EarNative {
             }
             Message::SetANC(l) => {
                 if let Some(d) = &mut self.connected_device {
+                    if d.anc_status == l {
+                        return Task::none();
+                    }
+
+                    // Apply change locally immediately and do not wait for device confirmation.
                     d.anc_status = l;
+
                     let proto = match l {
                         1 => 0x05,
                         2 => 0x07,
@@ -441,7 +465,11 @@ impl EarNative {
                         6 => 0x04,
                         _ => 0x05,
                     };
-                    return self.send_command(PacketCommand::SetAnc, vec![0x01, proto, 0x00]);
+
+                    return Task::batch(vec![
+                        self.send_command(PacketCommand::SetAnc, vec![0x01, proto, 0x00]),
+                        self.send_command(PacketCommand::SetAnc, vec![0x01, proto, 0x00]),
+                    ]);
                 }
             }
             Message::SetEQ(m) => {
@@ -579,7 +607,7 @@ impl EarNative {
                     d.latency_low = e;
                     return self.send_command(
                         PacketCommand::SetLatency,
-                        vec![if e { 0x01 } else { 0x02 }, 0x00],
+                        vec![if e { 0x01 } else { 0x00 }, 0x00],
                     );
                 }
             }
@@ -673,9 +701,9 @@ impl EarNative {
         let content: Element<'_, Message> = match &self.state {
             AppState::Disconnected => {
                 let header = column![
-                    text("ear (native)").font(Font::MONOSPACE).size(36),
+                    text("ear (native)").font(app_font()).size(36),
                     text("status: disconnected")
-                        .font(Font::MONOSPACE)
+                        .font(app_font())
                         .size(14)
                         .color(GREY),
                 ]
@@ -687,7 +715,7 @@ impl EarNative {
                 if self.discovered_devices.is_empty() {
                     list = list.push(
                         text("searching for devices...")
-                            .font(Font::MONOSPACE)
+                            .font(app_font())
                             .size(14)
                             .color(GREY),
                     );
@@ -713,7 +741,7 @@ impl EarNative {
                         list = list.push(
                             button(
                                 text(name.to_lowercase())
-                                    .font(Font::MONOSPACE)
+                                    .font(app_font())
                                     .size(14)
                                     .width(Length::Fill)
                                     .align_x(Alignment::Center),
@@ -748,17 +776,17 @@ impl EarNative {
             AppState::Error(msg) => container(
                 column![
                     text("!")
-                        .font(Font::MONOSPACE)
+                        .font(app_font())
                         .size(56)
                         .color(Color::from_rgb(1.0, 0.3, 0.3)),
-                    text("connection error").font(Font::MONOSPACE).size(22),
+                    text("connection error").font(app_font()).size(22),
                     text(msg.to_lowercase())
-                        .font(Font::MONOSPACE)
+                        .font(app_font())
                         .size(14)
                         .color(GREY),
                     button(
                         text("back to menu")
-                            .font(Font::MONOSPACE)
+                            .font(app_font())
                             .size(14)
                             .width(Length::Fill)
                             .align_x(Alignment::Center),
@@ -785,90 +813,52 @@ impl EarNative {
                 if self.initial_data_load.is_some() || !self.active_model_assets_ready {
                     self.loading_view("loading headphone data", model.name.to_lowercase())
                 } else if let Some(device) = &self.connected_device {
-                    let device_images: Element<'_, Message> =
-                        if !model.duo_img.is_empty() {
-                            row![container(
-                                image::<image::Handle>(embedded_image_handle(&model.duo_img),)
+                    let device_images: Element<'_, Message> = if !model.duo_img.is_empty() {
+                        row![container(
+                            image::<image::Handle>(embedded_image_handle(&model.duo_img),)
                                 .width(260)
                                 .filter_method(image::FilterMethod::Linear)
-                            )]
-                            .align_y(Alignment::Center)
-                            .into()
-                        } else {
-                            row![
-                                container(
-                                    image::<image::Handle>(embedded_image_handle(&model.left_img),)
+                        )]
+                        .align_y(Alignment::Center)
+                        .into()
+                    } else {
+                        row![
+                            container(
+                                image::<image::Handle>(embedded_image_handle(&model.left_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
-                                ),
-                                container(
-                                    image::<image::Handle>(embedded_image_handle(&model.case_img),)
+                            ),
+                            container(
+                                image::<image::Handle>(embedded_image_handle(&model.case_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
-                                ),
-                                container(
-                                    image::<image::Handle>(embedded_image_handle(&model.right_img),)
+                            ),
+                            container(
+                                image::<image::Handle>(embedded_image_handle(&model.right_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
-                                ),
-                            ]
-                            .spacing(16)
-                            .align_y(Alignment::Center)
-                            .into()
-                        };
-
-                    let batt_box = |label: &str, val: Option<u8>| {
-                        container(
-                            column![
-                                text(label.to_lowercase())
-                                    .font(Font::MONOSPACE)
-                                    .size(12)
-                                    .color(GREY),
-                                text(format!("{}%", val.unwrap_or(0)))
-                                    .font(Font::MONOSPACE)
-                                    .size(22),
-                            ]
-                            .align_x(Alignment::Center)
-                            .spacing(4),
-                        )
-                        .width(Length::Fill)
-                        .padding(12)
-                        .style(|_theme| container::Style {
-                            border: Border {
-                                color: BORDER_GREY,
-                                width: 1.0,
-                                radius: 0.0.into(),
-                            },
-                            ..Default::default()
-                        })
+                            ),
+                        ]
+                        .spacing(16)
+                        .align_y(Alignment::Center)
+                        .into()
                     };
 
-                    let battery_info = row![
-                        batt_box("left", device.battery_left),
-                        batt_box("case", device.battery_case),
-                        batt_box("right", device.battery_right),
-                    ]
-                    .spacing(8)
-                    .width(Length::Fill);
+                    let battery_info = battery::view(device);
 
                     let section_title = |t: &str| {
-                        container(
-                            text(t.to_lowercase())
-                                .font(Font::MONOSPACE)
-                                .size(12)
-                                .color(GREY),
-                        )
-                        .padding(Padding {
-                            top: 0.0,
-                            right: 0.0,
-                            bottom: 4.0,
-                            left: 0.0,
-                        })
+                        container(text(t.to_lowercase()).font(app_font()).size(12).color(GREY))
+                            .padding(Padding {
+                                top: 0.0,
+                                right: 0.0,
+                                bottom: 4.0,
+                                left: 0.0,
+                            })
                     };
 
                     let make_btn = |label: &str, is_active: bool, msg: Message| {
                         let t = text(label.to_lowercase())
-                            .font(Font::MONOSPACE)
+                            .font(app_font())
                             .size(14)
                             .width(Length::Fill)
                             .align_x(Alignment::Center);
@@ -882,298 +872,8 @@ impl EarNative {
                         }
                     };
 
-                    let make_small_btn = |label: &str, is_active: bool, msg: Message| {
-                        let t = text(label.to_lowercase())
-                            .font(Font::MONOSPACE)
-                            .size(12)
-                            .width(Length::Fill)
-                            .align_x(Alignment::Center);
-
-                        let b = button(t).on_press(msg).width(Length::Fill).padding(10);
-
-                        if is_active {
-                            b.style(btn_style_active)
-                        } else {
-                            b.style(btn_style_default)
-                        }
-                    };
-
-                    let anc_ui = column![
-                        section_title("noise control"),
-                        row![
-                            make_btn(
-                                "noise cancellation",
-                                device.anc_status >= 3,
-                                Message::SetANC(4)
-                            ),
-                            make_btn("transparent", device.anc_status == 2, Message::SetANC(2)),
-                            make_btn("off", device.anc_status == 1, Message::SetANC(1)),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                        if device.anc_status >= 3 {
-                            EarNative::anc_strength_options(model).into_iter().fold(
-                                row![].spacing(8).width(Length::Fill),
-                                |row, (preset, label)| {
-                                    row.push(make_small_btn(
-                                        label,
-                                        device.anc_status == preset,
-                                        Message::SetANC(preset),
-                                    ))
-                                },
-                            )
-                        } else {
-                            row![]
-                        },
-                        if EarNative::supports_personalized_anc(model) {
-                            row![make_btn(
-                                if device.personalized_anc_enabled {
-                                    "personalized anc [ on ]"
-                                } else {
-                                    "personalized anc [ off ]"
-                                },
-                                device.personalized_anc_enabled,
-                                Message::SetPersonalizedANC(!device.personalized_anc_enabled)
-                            )]
-                        } else {
-                            row![]
-                        }
-                    ]
-                    .spacing(8);
-
-                    let eq_ui = column![
-                        section_title("equalizer"),
-                        EarNative::eq_presets(model).chunks(2).fold(
-                            column![].spacing(8),
-                            |column, chunk| {
-                                let mut current_row = row![].spacing(8).width(Length::Fill);
-
-                                for (preset, label) in chunk {
-                                    let message =
-                                        if EarNative::supports_advanced_eq(model) && *preset == 6 {
-                                            Message::ToggleAdvancedEQ(true)
-                                        } else {
-                                            Message::SetEQ(*preset)
-                                        };
-
-                                    current_row = current_row.push(make_btn(
-                                        label,
-                                        EarNative::eq_button_active(
-                                            model,
-                                            *preset,
-                                            device.eq_preset,
-                                            device.advanced_eq_enabled,
-                                        ),
-                                        message,
-                                    ));
-                                }
-
-                                if chunk.len() == 1 {
-                                    current_row =
-                                        current_row.push(Space::new().width(Length::Fill));
-                                }
-
-                                column.push(current_row)
-                            }
-                        )
-                    ]
-                    .spacing(8);
-
-                    let custom_eq_ui = if EarNative::supports_custom_eq(&device.model)
-                        && EarNative::custom_eq_active(
-                            model,
-                            device.eq_preset,
-                            device.advanced_eq_enabled,
-                        ) {
-                        let band_editor = |label: &'static str, value: f32, band_index: usize| {
-                            let meter = (0..=12).rev().fold(
-                                column![].spacing(4).align_x(Alignment::Center),
-                                |column, level| {
-                                    let step_value = level as i8 - 6;
-                                    let is_center = step_value == 0;
-                                    let current_level = value as i8;
-                                    let is_active = if current_level > 0 {
-                                        step_value > 0 && step_value <= current_level
-                                    } else if current_level < 0 {
-                                        step_value < 0 && step_value >= current_level
-                                    } else {
-                                        false
-                                    };
-
-                                    column.push(
-                                        mouse_area(container(text("")).width(24).height(6).style(
-                                            move |_theme| {
-                                                container::Style {
-                                                    background: Some(
-                                                        if is_active {
-                                                            PURE_WHITE
-                                                        } else if is_center {
-                                                            Color::from_rgb(0.18, 0.18, 0.18)
-                                                        } else {
-                                                            Color::from_rgb(0.08, 0.08, 0.08)
-                                                        }
-                                                        .into(),
-                                                    ),
-                                                    border: Border {
-                                                        color: if is_center {
-                                                            GREY
-                                                        } else {
-                                                            BORDER_GREY
-                                                        },
-                                                        width: 1.0,
-                                                        radius: 0.0.into(),
-                                                    },
-                                                    ..Default::default()
-                                                }
-                                            },
-                                        ))
-                                        .interaction(mouse::Interaction::Pointer)
-                                        .on_press(
-                                            Message::SetCustomEQLevel(band_index, step_value),
-                                        ),
-                                    )
-                                },
-                            );
-
-                            mouse_area(
-                                container(
-                                    column![
-                                        text(label).font(Font::MONOSPACE).size(12).color(GREY),
-                                        text(format!("{:+.0} dB", value))
-                                            .font(Font::MONOSPACE)
-                                            .size(16),
-                                        meter,
-                                        row![
-                                            button(
-                                                text("-")
-                                                    .font(Font::MONOSPACE)
-                                                    .size(16)
-                                                    .align_x(Alignment::Center)
-                                            )
-                                            .on_press(Message::DecCustomEQ(band_index))
-                                            .width(Length::Fill)
-                                            .padding(8)
-                                            .style(btn_style_default),
-                                            button(
-                                                text("+")
-                                                    .font(Font::MONOSPACE)
-                                                    .size(16)
-                                                    .align_x(Alignment::Center)
-                                            )
-                                            .on_press(Message::IncCustomEQ(band_index))
-                                            .width(Length::Fill)
-                                            .padding(8)
-                                            .style(btn_style_default),
-                                        ]
-                                        .spacing(8)
-                                        .width(Length::Fill),
-                                    ]
-                                    .spacing(12)
-                                    .align_x(Alignment::Center),
-                                )
-                                .width(Length::Fill)
-                                .padding(Padding {
-                                    top: 14.0,
-                                    right: 12.0,
-                                    bottom: 12.0,
-                                    left: 12.0,
-                                }),
-                            )
-                            .interaction(mouse::Interaction::Pointer)
-                            .on_scroll(move |delta| {
-                                let step = match delta {
-                                    mouse::ScrollDelta::Lines { y, .. } => {
-                                        if y > 0.0 {
-                                            1
-                                        } else if y < 0.0 {
-                                            -1
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                    mouse::ScrollDelta::Pixels { y, .. } => {
-                                        if y > 0.0 {
-                                            1
-                                        } else if y < 0.0 {
-                                            -1
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                };
-
-                                Message::ScrollCustomEQ(band_index, step)
-                            })
-                        };
-
-                        column![
-                            section_title("custom eq"),
-                            container(
-                                column![row![
-                                    band_editor("low", device.custom_eq[0], 0),
-                                    band_editor("mid", device.custom_eq[1], 1),
-                                    band_editor("high", device.custom_eq[2], 2),
-                                ]
-                                .spacing(8)
-                                .width(Length::Fill),]
-                                .spacing(16),
-                            )
-                            .padding(16)
-                            .width(Length::Fill)
-                            .style(|_theme| container::Style {
-                                background: Some(Color::from_rgb(0.03, 0.03, 0.03).into()),
-                                border: Border {
-                                    color: if EarNative::custom_eq_active(
-                                        model,
-                                        device.eq_preset,
-                                        device.advanced_eq_enabled,
-                                    ) {
-                                        PURE_WHITE
-                                    } else {
-                                        BORDER_GREY
-                                    },
-                                    width: 1.0,
-                                    radius: 0.0.into(),
-                                },
-                                ..Default::default()
-                            }),
-                        ]
-                        .spacing(8)
-                    } else {
-                        column![]
-                    };
-
-                    let advanced_eq_ui = if device.advanced_eq_enabled {
-                        column![
-                            section_title("advanced eq"),
-                            container(
-                                column![
-                                    text("advanced eq is enabled")
-                                        .font(Font::MONOSPACE)
-                                        .size(14),
-                                    text("select another preset to leave advanced mode")
-                                        .font(Font::MONOSPACE)
-                                        .size(12)
-                                        .color(GREY),
-                                ]
-                                .spacing(6),
-                            )
-                            .padding(16)
-                            .width(Length::Fill)
-                            .style(|_theme| container::Style {
-                                background: Some(Color::from_rgb(0.03, 0.03, 0.03).into()),
-                                border: Border {
-                                    color: PURE_WHITE,
-                                    width: 1.0,
-                                    radius: 0.0.into(),
-                                },
-                                ..Default::default()
-                            }),
-                        ]
-                        .spacing(8)
-                    } else {
-                        column![]
-                    };
+                    let anc_ui = anc::view(model, device);
+                    let eq_ui = equalizer::view(model, device);
 
                     let ultra_bass_ui = if EarNative::supports_ultra_bass(&device.model) {
                         column![
@@ -1260,7 +960,7 @@ impl EarNative {
                         container(
                             column![
                                 text(EarNative::confirm_message(target))
-                                    .font(Font::MONOSPACE)
+                                    .font(app_font())
                                     .size(12)
                                     .color(GREY),
                                 row![
@@ -1290,9 +990,9 @@ impl EarNative {
                         let tip_card = |label: &'static str, value: Option<u8>| {
                             container(
                                 column![
-                                    text(label).font(Font::MONOSPACE).size(12).color(GREY),
+                                    text(label).font(app_font()).size(12).color(GREY),
                                     text(EarNative::ear_tip_status_label(value))
-                                        .font(Font::MONOSPACE)
+                                        .font(app_font())
                                         .size(14)
                                         .color(EarNative::ear_tip_status_color(value)),
                                 ]
@@ -1320,7 +1020,7 @@ impl EarNative {
                                         device.ear_tip_right,
                                         device.ear_tip_test_running,
                                     ))
-                                    .font(Font::MONOSPACE)
+                                    .font(app_font())
                                     .size(12)
                                     .color(GREY),
                                     row![
@@ -1387,10 +1087,8 @@ impl EarNative {
                         ),
                         container(
                             row![
-                                text("firmware:").font(Font::MONOSPACE).size(12).color(GREY),
-                                text(&device.firmware_version)
-                                    .font(Font::MONOSPACE)
-                                    .size(12)
+                                text("firmware:").font(app_font()).size(12).color(GREY),
+                                text(&device.firmware_version).font(app_font()).size(12)
                             ]
                             .spacing(8)
                         )
@@ -1405,7 +1103,7 @@ impl EarNative {
 
                     let disconnect_btn = button(
                         text("disconnect")
-                            .font(Font::MONOSPACE)
+                            .font(app_font())
                             .size(14)
                             .width(Length::Fill)
                             .align_x(Alignment::Center),
@@ -1418,16 +1116,18 @@ impl EarNative {
                     scrollable(
                         column![
                             text(model.name.to_lowercase())
-                                .font(Font::MONOSPACE)
+                                .font(app_font())
                                 .size(28)
                                 .width(Length::Fill)
                                 .align_x(Alignment::Center),
                             device_images,
                             battery_info,
-                            if model.is_anc { anc_ui } else { column![] },
+                            if model.is_anc {
+                                anc_ui
+                            } else {
+                                column![].into()
+                            },
                             eq_ui,
-                            custom_eq_ui,
-                            advanced_eq_ui,
                             ultra_bass_ui,
                             ring_ui,
                             confirmation_ui,
@@ -1443,7 +1143,7 @@ impl EarNative {
                     .into()
                 } else {
                     column![text("error: device sync lost")
-                        .font(Font::MONOSPACE)
+                        .font(app_font())
                         .size(14)
                         .color(Color::from_rgb(0.9, 0.2, 0.2))]
                     .align_x(Alignment::Center)
@@ -1489,7 +1189,7 @@ impl EarNative {
     }
 
     fn supports_custom_eq(model: &ModelInfo) -> bool {
-        model.base != "B181"
+        equalizer::supports_custom_eq(model)
     }
 
     fn build_custom_eq_payload(custom_eq: [f32; 3]) -> Vec<u8> {
@@ -1540,9 +1240,9 @@ impl EarNative {
 
         container(
             column![
-                text(spinner).font(Font::MONOSPACE).size(56),
-                text(title).font(Font::MONOSPACE).size(22),
-                text(subtitle).font(Font::MONOSPACE).size(14).color(GREY),
+                text(spinner).font(app_font()).size(56),
+                text(title).font(app_font()).size(22),
+                text(subtitle).font(app_font()).size(14).color(GREY),
             ]
             .spacing(16)
             .align_x(Alignment::Center),
@@ -1573,7 +1273,7 @@ impl EarNative {
         Task::batch(vec![
             Task::perform(
                 async move {
-                    preload_model_images(std::iter::once(&asset_model));
+                    preload_model_images_in_background(vec![asset_model]).await;
                 },
                 |_| Message::ActiveModelAssetsPreloaded,
             ),
@@ -1661,6 +1361,51 @@ impl EarNative {
         Task::none()
     }
 
+    fn persist_config(&self) -> Task<Message> {
+        let config = self.config.clone();
+        Task::perform(async move { config.save() }, Message::ConfigPersisted)
+    }
+
+    fn maybe_auto_connect(&mut self, device: &DiscoveredDevice) -> Option<Task<Message>> {
+        let Some(last_connected) = self.config.last_connected_device_id.as_deref() else {
+            return None;
+        };
+
+        if !matches!(self.state, AppState::Disconnected) || self.connected_device.is_some() {
+            return None;
+        }
+
+        if let Some(last_attempt) = self.last_auto_connect_at {
+            if last_attempt.elapsed() < Duration::from_secs(30) {
+                log::info!(
+                    "Skipping auto-connect for {} because the last auto-connect attempt was {}s ago",
+                    device.name,
+                    last_attempt.elapsed().as_secs()
+                );
+                return None;
+            }
+        }
+
+        if !device.system_connected
+            || !device.paired
+            || device.id != last_connected
+            || self.cmd_tx.is_none()
+        {
+            return None;
+        }
+
+        log::info!(
+            "Auto-connecting to system-connected device: {}",
+            device.name
+        );
+        self.last_auto_connect_at = Some(Instant::now());
+        self.state = AppState::Connecting("system reconnect".to_string());
+        self.active_model_assets_ready = true;
+        self.loading_frame = 0;
+
+        Some(self.send_manager_command(ManagerCommand::Connect(device.id.clone())))
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         let bluetooth = Subscription::run(|| {
             iced::stream::channel(
@@ -1669,19 +1414,26 @@ impl EarNative {
                     let (tx, mut rx) = mpsc::channel(100);
                     let (cmd_tx, cmd_rx) = mpsc::channel(100);
                     let _ = output.send(Message::Ready(cmd_tx)).await;
-                    if let Ok(manager) = BluetoothManager::new(tx, cmd_rx).await {
-                        let _ = manager.start_discovery().await;
-                        let run_m = manager.run();
-                        let out_l = async {
-                            while let Some(e) = rx.recv().await {
-                                let _ = output.send(Message::Bluetooth(e)).await;
+                    let manager = loop {
+                        match create_adapter().await {
+                            Ok(adapter) => {
+                                break BluetoothManager::new(adapter, tx.clone(), cmd_rx)
                             }
-                        };
-                        tokio::select! { _ = run_m => {}, _ = out_l => {}, }
-                    }
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+                            Err(error) => {
+                                log::warn!("Bluetooth adapter not ready yet: {}", error);
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            }
+                        }
+                    };
+
+                    let _ = manager.start_discovery().await;
+                    let run_m = manager.run();
+                    let out_l = async {
+                        while let Some(e) = rx.recv().await {
+                            let _ = output.send(Message::Bluetooth(e)).await;
+                        }
+                    };
+                    tokio::select! { _ = run_m => {}, _ = out_l => {}, }
                 },
             )
         });
@@ -1691,7 +1443,8 @@ impl EarNative {
         let is_loading = matches!(
             self.state,
             AppState::Connecting(_) | AppState::Identifying(_)
-        ) || self.initial_data_load.is_some() || !self.active_model_assets_ready;
+        ) || self.initial_data_load.is_some()
+            || !self.active_model_assets_ready;
 
         let mut subs = vec![bluetooth, tray];
 
@@ -1744,6 +1497,24 @@ impl EarNative {
                     model.base,
                     sku
                 );
+
+                if let Some(device_id) = self
+                    .connected_device
+                    .as_ref()
+                    .map(|device| device.id.clone())
+                {
+                    if self.config.remember_device_metadata(
+                        &device_id,
+                        Some(&model.name),
+                        Some(&model_key),
+                        Some(&sku),
+                    ) {
+                        return Task::batch(vec![
+                            self.persist_config(),
+                            self.start_initial_data_load(model),
+                        ]);
+                    }
+                }
 
                 return self.start_initial_data_load(model);
             }

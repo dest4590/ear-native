@@ -3,6 +3,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use tokio::task;
 
 #[derive(RustEmbed)]
 #[folder = "res/assets/"]
@@ -29,7 +30,9 @@ pub fn embedded_image_handle(asset_path: &str) -> image::Handle {
     let cache = IMAGE_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     {
-        let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(handle) = cache.get(asset_path) {
             return handle.clone();
         }
@@ -38,7 +41,9 @@ pub fn embedded_image_handle(asset_path: &str) -> image::Handle {
     let handle = decode_embedded_image_handle(asset_path);
 
     {
-        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.insert(asset_path.to_string(), handle.clone());
     }
 
@@ -49,7 +54,12 @@ pub fn preload_model_images<'a>(models: impl IntoIterator<Item = &'a ModelInfo>)
     let mut asset_paths = HashSet::new();
 
     for model in models {
-        for asset_path in [&model.left_img, &model.case_img, &model.right_img, &model.duo_img] {
+        for asset_path in [
+            &model.left_img,
+            &model.case_img,
+            &model.right_img,
+            &model.duo_img,
+        ] {
             if !asset_path.is_empty() {
                 asset_paths.insert(asset_path.as_str());
             }
@@ -58,6 +68,17 @@ pub fn preload_model_images<'a>(models: impl IntoIterator<Item = &'a ModelInfo>)
 
     for asset_path in asset_paths {
         let _ = embedded_image_handle(asset_path);
+    }
+}
+
+pub async fn preload_model_images_in_background(models: Vec<ModelInfo>) {
+    let result = task::spawn_blocking(move || {
+        preload_model_images(models.iter());
+    })
+    .await;
+
+    if let Err(error) = result {
+        log::error!("image preload task failed: {}", error);
     }
 }
 
@@ -90,8 +111,6 @@ fn decode_embedded_image_handle(asset_path: &str) -> image::Handle {
 
     image::Handle::from_rgba(width, height, rgba.into_raw())
 }
-
-
 
 pub fn get_models() -> HashMap<String, ModelInfo> {
     let mut m = HashMap::new();

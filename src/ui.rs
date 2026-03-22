@@ -1,9 +1,14 @@
-use iced::{widget::button, Border, Color, Shadow, Theme};
+use iced::{widget::button, Border, Color, Font, Shadow, Theme};
 
 pub const PURE_BLACK: Color = Color::from_rgb(0.0, 0.0, 0.0);
 pub const PURE_WHITE: Color = Color::from_rgb(1.0, 1.0, 1.0);
 pub const GREY: Color = Color::from_rgb(0.4, 0.4, 0.4);
 pub const BORDER_GREY: Color = Color::from_rgb(0.15, 0.15, 0.15);
+pub const APP_FONT_NAME: &str = "Silkscreen";
+
+pub fn app_font() -> Font {
+    Font::with_name(APP_FONT_NAME)
+}
 
 pub fn btn_style_default(_theme: &Theme, status: button::Status) -> button::Style {
     let base = button::Style {

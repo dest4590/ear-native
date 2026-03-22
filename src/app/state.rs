@@ -2,6 +2,7 @@ use crate::mpsc;
 use crate::protocol::EqMode;
 use crate::{
     bluetooth::{BluetoothEvent, ManagerCommand},
+    config::AppConfig,
     models::ModelInfo,
     EarNative,
 };
@@ -18,6 +19,8 @@ pub enum Message {
     SetCustomEQLevel(usize, i8),
     LoadingTick,
     InitialDataLoadTimedOut,
+    ConfigLoaded(AppConfig),
+    ConfigPersisted(Result<(), String>),
     SetANC(u8),
     SetEQ(u8),
     ToggleAdvancedEQ(bool),
@@ -59,6 +62,7 @@ pub enum AppState {
 }
 
 pub struct ConnectedDevice {
+    pub id: String,
     pub model: ModelInfo,
     pub battery_left: Option<u8>,
     pub sku_attempts: u8,

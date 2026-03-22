@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 iced = { version = "0.14.0", features = ["image", "svg", "tokio"] }
-rust-embed = { version = "8", features = ["include-flate"] }
+rust-embed = { version = "8.11.0", features = ["include-flate"] }
 tokio = { version = "1.50.0", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -16,18 +16,20 @@ bytes = "1.11.1"
 futures = "0.3.32"
 uuid = { version = "1.22.0", features = ["v4"] }
 image = "0.25.10"
+async-trait = "0.1.89"
+directories = "6.0.0"
 resvg = "0.47.0"
 tiny-skia = "0.12.0"
 usvg = "0.47.0"
 iced_futures = "0.14.0"
-tray-icon = "0.19"
+tray-icon = "0.21.3"
 webp = "0.3.1"
 num_enum = "0.7.6"
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17.4", features = ["full"] }
-notify-rust = "4"
+notify-rust = "4.12.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = [

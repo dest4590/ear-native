@@ -1,6 +1,7 @@
 use crc::{Algorithm, Crc};
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
+use std::array;
 use std::convert::TryFrom;
 
 pub const CRC_16_ARC: Algorithm<u16> = Algorithm {
@@ -17,6 +18,7 @@ pub const CRC_16_ARC: Algorithm<u16> = Algorithm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
 #[repr(u16)]
 pub enum PacketCommand {
+    Unknown = 0,
     ReadBattery = 49159,
     ReadAnc = 49182,
     SetAnc = 61455,
@@ -221,14 +223,22 @@ pub fn calculate_crc(data: &[u8]) -> u16 {
 #[derive(Debug, Clone)]
 pub struct Packet {
     pub command: PacketCommand,
+    pub raw_command: u16,
     pub payload: Vec<u8>,
     pub operation_id: u8,
 }
 
 impl Packet {
+    pub const FRAME_MARKER: u8 = 0x55;
+    const HEADER_LEN: usize = 8;
+    const TRAILER_LEN: usize = 2;
+    const MIN_FRAME_LEN: usize = Self::HEADER_LEN + Self::TRAILER_LEN;
+
     pub fn new(command: PacketCommand, payload: Vec<u8>, operation_id: u8) -> Self {
+        let raw_command = command as u16;
         Self {
             command,
+            raw_command,
             payload,
             operation_id,
         }
@@ -236,7 +246,7 @@ impl Packet {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut data = vec![
-            0x55,
+            Self::FRAME_MARKER,
             0x60,
             0x01,
             0,
@@ -254,43 +264,82 @@ impl Packet {
         data
     }
 
+    pub fn encoded_len(bytes: &[u8]) -> Option<usize> {
+        if bytes.first().copied()? != Self::FRAME_MARKER {
+            return None;
+        }
+
+        Some(Self::MIN_FRAME_LEN + (*bytes.get(5)? as usize))
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 10 || bytes[0] != 0x55 {
+        if bytes.len() < Self::MIN_FRAME_LEN || bytes.first().copied()? != Self::FRAME_MARKER {
             return None;
         }
 
-        let command = PacketCommand::try_from(u16::from_le_bytes([bytes[3], bytes[4]])).ok()?;
-        let len = bytes[5] as usize;
-        let op = bytes[7];
+        let total_len = Self::encoded_len(bytes)?;
+        let frame = bytes.get(..total_len)?;
 
-        if bytes.len() < 10 + len {
-            return None;
+        let crc_received =
+            u16::from_le_bytes(frame.get(total_len - 2..total_len)?.try_into().ok()?);
+        let crc_calculated = calculate_crc(frame.get(..total_len - Self::TRAILER_LEN)?);
+        if crc_calculated != crc_received {
+            log::trace!(
+                "BT packet CRC mismatch: calculated 0x{:04x}, received 0x{:04x} (accepted anyway)",
+                crc_calculated,
+                crc_received
+            );
         }
+
+        let raw_cmd = u16::from_le_bytes([*frame.get(3)?, *frame.get(4)?]);
+        let command = PacketCommand::try_from(raw_cmd).unwrap_or_else(|_| {
+            log::debug!(
+                "Unknown BT command 0x{:04x} ({}), treating as Unknown",
+                raw_cmd,
+                raw_cmd
+            );
+            PacketCommand::Unknown
+        });
+        let len = *frame.get(5)? as usize;
+        let op = *frame.get(7)?;
+
+        let payload = frame
+            .get(Self::HEADER_LEN..Self::HEADER_LEN + len)?
+            .to_vec();
 
         Some(Self {
             command,
-            payload: bytes[8..8 + len].to_vec(),
+            raw_command: raw_cmd,
+            payload,
             operation_id: op,
         })
+    }
+
+    fn payload_byte(&self, index: usize) -> Option<u8> {
+        self.payload.get(index).copied()
+    }
+
+    fn payload_array<const N: usize>(&self, start: usize) -> Option<[u8; N]> {
+        self.payload.get(start..start + N)?.try_into().ok()
     }
 
     pub fn parse(&self) -> ParsedResponse {
         match self.command {
             PacketCommand::RespBattery | PacketCommand::RespBatteryAlt => {
                 let mut battery = DeviceBattery::default();
-                let count = *self.payload.get(0).unwrap_or(&0) as usize;
+                let count = self.payload_byte(0).unwrap_or(0) as usize;
 
-                for i in 0..count {
-                    let base = 1 + i * 2;
-                    if base + 1 >= self.payload.len() {
-                        break;
-                    }
-
-                    let id = self.payload[base];
-                    let s = self.payload[base + 1];
+                for [id, status] in self
+                    .payload
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .chunks_exact(2)
+                    .take(count)
+                    .map(|chunk| [chunk[0], chunk[1]])
+                {
                     let stat = BatteryStatus {
-                        level: s & 0x7F,
-                        is_charging: s & 0x80 != 0,
+                        level: status & 0x7F,
+                        is_charging: status & 0x80 != 0,
                     };
 
                     match DeviceId::from_u8(id) {
@@ -305,7 +354,7 @@ impl Packet {
             }
 
             PacketCommand::RespAnc | PacketCommand::RespAncAlt => {
-                let v = self.payload.get(1).copied().unwrap_or(0);
+                let v = self.payload_byte(1).unwrap_or(0);
                 AncMode::from_u8(v)
                     .map(ParsedResponse::Anc)
                     .unwrap_or_else(|| {
@@ -313,8 +362,12 @@ impl Packet {
                     })
             }
 
+            PacketCommand::Unknown => {
+                ParsedResponse::Unknown(self.raw_command, self.payload.clone())
+            }
+
             PacketCommand::RespEq | PacketCommand::RespEqAlt => {
-                let preset = self.payload.get(0).copied().unwrap_or(0);
+                let preset = self.payload_byte(0).unwrap_or(0);
                 let mode = EqMode::from_u8(preset).unwrap_or(EqMode::Balanced);
                 ParsedResponse::Eq { mode, preset }
             }
@@ -324,31 +377,31 @@ impl Packet {
             }
 
             PacketCommand::RespInEar => {
-                ParsedResponse::InEar(self.payload.get(2).copied().unwrap_or(0) != 0)
+                ParsedResponse::InEar(self.payload_byte(2).unwrap_or(0) != 0)
             }
 
             PacketCommand::RespLatency => {
-                ParsedResponse::Latency(self.payload.get(0).copied().unwrap_or(0) != 0)
+                ParsedResponse::Latency(self.payload_byte(0).unwrap_or(0) != 0)
             }
 
             PacketCommand::RespGesture => {
-                let count = *self.payload.get(0).unwrap_or(&0) as usize;
+                let count = self.payload_byte(0).unwrap_or(0) as usize;
                 let mut out = Vec::new();
 
-                for i in 0..count {
-                    let base = 1 + i * 4;
-                    if base + 3 >= self.payload.len() {
-                        break;
-                    }
-
-                    if let (Some(d), Some(t)) = (
-                        DeviceId::from_u8(self.payload[base]),
-                        GestureType::from_u8(self.payload[base + 2]),
-                    ) {
+                for chunk in self
+                    .payload
+                    .get(1..)
+                    .unwrap_or(&[])
+                    .chunks_exact(4)
+                    .take(count)
+                {
+                    if let (Some(d), Some(t)) =
+                        (DeviceId::from_u8(chunk[0]), GestureType::from_u8(chunk[2]))
+                    {
                         out.push(Gesture {
                             device: d,
                             gesture_type: t,
-                            action: GestureAction::from_u8(self.payload[base + 3]),
+                            action: GestureAction::from_u8(chunk[3]),
                         });
                     }
                 }
@@ -357,59 +410,28 @@ impl Packet {
             }
 
             PacketCommand::RespAdvancedEqStatus => {
-                ParsedResponse::AdvancedEq(self.payload.get(0) == Some(&1))
+                ParsedResponse::AdvancedEq(self.payload_byte(0) == Some(1))
             }
 
-            PacketCommand::RespCustomEq | PacketCommand::ReadCustomEq => {
-                if self.payload.len() >= 45 {
-                    fn from_format_float_for_eq(mut bytes: [u8; 4]) -> f32 {
-                        bytes.reverse();
-
-                        if bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && (bytes[3] & 0x80) != 0
-                        {
-                            bytes[3] &= 0x7f;
-                            -f32::from_be_bytes(bytes)
-                        } else {
-                            f32::from_be_bytes(bytes)
-                        }
-                    }
-
-                    let mut values = [0.0f32; 3];
-                    for (index, slot) in values.iter_mut().enumerate() {
-                        let base = 6 + (index * 13);
-                        if base + 3 >= self.payload.len() {
-                            break;
-                        }
-                        let bytes = [
-                            self.payload[base],
-                            self.payload[base + 1],
-                            self.payload[base + 2],
-                            self.payload[base + 3],
-                        ];
-                        *slot = from_format_float_for_eq(bytes).round().clamp(-6.0, 6.0);
-                    }
-                    ParsedResponse::CustomEq([values[2], values[0], values[1]])
-                } else {
+            PacketCommand::RespCustomEq | PacketCommand::ReadCustomEq => parse_custom_eq(self)
+                .map(ParsedResponse::CustomEq)
+                .unwrap_or_else(|| {
                     ParsedResponse::Unknown(self.command as u16, self.payload.clone())
-                }
-            }
+                }),
 
             PacketCommand::RespEarFitTest => {
-                if self.payload.len() >= 2 {
-                    ParsedResponse::EarFitTest {
-                        left: self.payload[0],
-                        right: self.payload[1],
-                    }
+                if let Some([left, right]) = self.payload_array::<2>(0) {
+                    ParsedResponse::EarFitTest { left, right }
                 } else {
                     ParsedResponse::Unknown(self.command as u16, self.payload.clone())
                 }
             }
 
             PacketCommand::RespEnhancedBass | PacketCommand::ReadEnhancedBass => {
-                if self.payload.len() >= 2 {
+                if let Some([enabled, level]) = self.payload_array::<2>(0) {
                     ParsedResponse::EnhancedBass {
-                        enabled: self.payload[0] == 0x01,
-                        level: self.payload[1] / 2,
+                        enabled: enabled == 0x01,
+                        level: level / 2,
                     }
                 } else {
                     ParsedResponse::Unknown(self.command as u16, self.payload.clone())
@@ -417,14 +439,14 @@ impl Packet {
             }
 
             PacketCommand::RespPersonalizedAnc | PacketCommand::ReadPersonalizedAnc => {
-                ParsedResponse::PersonalizedAnc(self.payload.get(0) == Some(&1))
+                ParsedResponse::PersonalizedAnc(self.payload_byte(0) == Some(1))
             }
 
             PacketCommand::RespSku | PacketCommand::ReadSku | PacketCommand::ReadSkuAlt => {
-                let sku = if self.payload.len() >= 2 {
-                    format!("{:02x}", self.payload[1])
-                } else if !self.payload.is_empty() {
-                    format!("{:02x}", self.payload[0])
+                let sku = if let Some(value) = self.payload_byte(1) {
+                    format!("{:02x}", value)
+                } else if let Some(value) = self.payload_byte(0) {
+                    format!("{:02x}", value)
                 } else {
                     "unknown".to_string()
                 };
@@ -433,5 +455,58 @@ impl Packet {
 
             _ => ParsedResponse::Unknown(self.command as u16, self.payload.clone()),
         }
+    }
+}
+
+fn parse_custom_eq(packet: &Packet) -> Option<[f32; 3]> {
+    if packet.payload.len() < 45 {
+        return None;
+    }
+
+    let values: [f32; 3] = array::from_fn(|index| {
+        let base = 6 + (index * 13);
+        packet
+            .payload_array::<4>(base)
+            .map(from_format_float_for_eq)
+            .map(|value| value.round().clamp(-6.0, 6.0))
+            .unwrap_or(0.0)
+    });
+
+    Some([values[2], values[0], values[1]])
+}
+
+fn from_format_float_for_eq(mut bytes: [u8; 4]) -> f32 {
+    bytes.reverse();
+
+    if bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && (bytes[3] & 0x80) != 0 {
+        bytes[3] &= 0x7f;
+        -f32::from_be_bytes(bytes)
+    } else {
+        f32::from_be_bytes(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_round_trip_validates_crc() {
+        let packet = Packet::new(PacketCommand::ReadBattery, vec![1, 2, 3], 9);
+        let encoded = packet.to_bytes();
+        let decoded = Packet::from_bytes(&encoded).expect("packet should decode");
+
+        assert_eq!(decoded.command, PacketCommand::ReadBattery);
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
+        assert_eq!(decoded.operation_id, 9);
+    }
+
+    #[test]
+    fn packet_rejects_invalid_crc() {
+        let mut encoded = Packet::new(PacketCommand::ReadBattery, vec![1, 2, 3], 9).to_bytes();
+        let last_index = encoded.len() - 1;
+        encoded[last_index] ^= 0xFF;
+
+        assert!(Packet::from_bytes(&encoded).is_none());
     }
 }
