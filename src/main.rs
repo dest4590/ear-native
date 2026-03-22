@@ -1,26 +1,107 @@
-use futures::SinkExt;
+﻿use futures::{channel::mpsc::Sender, SinkExt};
 use iced::{
     mouse, time,
     widget::{button, column, container, image, mouse_area, row, scrollable, text, Space},
     Alignment, Border, Color, Element, Font, Length, Padding, Subscription, Task, Theme,
 };
+
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+mod app;
 mod bluetooth;
 mod models;
 mod protocol;
 mod ui;
 
 use bluetooth::{BluetoothEvent, BluetoothManager, ManagerCommand};
-use models::{get_models, get_sku_map, DeviceId, EqMode, ModelInfo};
-use protocol::{commands, Packet};
+use models::{embedded_image_handle, get_models, get_sku_map, preload_model_images, ModelInfo};
+use protocol::Packet;
 use ui::{
     btn_style_active, btn_style_default, btn_style_red, BORDER_GREY, GREY, PURE_BLACK, PURE_WHITE,
 };
 
+use std::time::{Duration, Instant};
+
+use crate::{
+    app::state::{
+        AppState, ConnectedDevice, InitialDataLoad, Message, PendingConfirmation, RingTarget,
+    },
+    protocol::{AncMode, DeviceId, EqMode, PacketCommand, ParsedResponse},
+};
+
+struct EarNative {
+    models: HashMap<String, ModelInfo>,
+    sku_map: HashMap<String, String>,
+    active_model_assets_ready: bool,
+    state: AppState,
+    discovered_devices: Vec<(String, String)>,
+    connected_device: Option<ConnectedDevice>,
+    initial_data_load: Option<InitialDataLoad>,
+    loading_frame: usize,
+    cmd_tx: Option<mpsc::Sender<ManagerCommand>>,
+    operation_id: u8,
+    pending_confirmation: Option<PendingConfirmation>,
+}
+
+fn tray_event_stream() -> impl futures::Stream<Item = Message> + 'static {
+    iced::stream::channel(100, |mut output: Sender<Message>| async move {
+        use iced::futures::SinkExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+            let _ = tx.send(event);
+        }));
+
+        let mut last_click = Instant::now() - Duration::from_secs(1);
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } => {
+                    if last_click.elapsed() < Duration::from_millis(120) {
+                        continue;
+                    }
+
+                    last_click = Instant::now();
+                    let _ = output.send(Message::TrayIconClicked).await;
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 pub fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let _tray_icon = {
+        let size = 32u32;
+        let cx = size as f32 / 2.0;
+        let cy = size as f32 / 2.0;
+        let r = size as f32 / 2.0 - 1.5;
+        let rgba: Vec<u8> = (0..size)
+            .flat_map(|y| {
+                (0..size).flat_map(move |x| {
+                    let dx = x as f32 - cx;
+                    let dy = y as f32 - cy;
+                    if (dx * dx + dy * dy).sqrt() <= r {
+                        [255u8, 255, 255, 255]
+                    } else {
+                        [0u8, 0, 0, 0]
+                    }
+                })
+            })
+            .collect();
+        tray_icon::TrayIconBuilder::new()
+            .with_tooltip("ear-native")
+            .with_icon(tray_icon::Icon::from_rgba(rgba, size, size).expect("tray icon rgba"))
+            .build()
+            .expect("failed to create tray icon")
+    };
 
     let mut settings = iced::window::Settings::default();
     settings.size = iced::Size::new(450.0, 700.0);
@@ -32,139 +113,12 @@ pub fn main() -> iced::Result {
         .run()
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    Bluetooth(BluetoothEvent),
-    Connect(String),
-    Disconnect,
-    SendCustomEQ,
-    IncCustomEQ(usize),
-    DecCustomEQ(usize),
-    ScrollCustomEQ(usize, i8),
-    SetCustomEQLevel(usize, i8),
-    LoadingTick,
-    InitialDataLoadTimedOut,
-    SetANC(u8),
-    SetEQ(u8),
-    ToggleAdvancedEQ(bool),
-    SetBassLevel(u8),
-    ToggleBassEnhance(bool),
-    RequestRing(RingTarget),
-    StopRing(RingTarget),
-    ConfirmPendingAction,
-    CancelPendingAction,
-    SetPersonalizedANC(bool),
-    StartEarTipTest,
-    ResetEarTipTest,
-    ToggleInEar(bool),
-    ToggleLatency(bool),
-    CommandSent(Packet),
-    Ready(mpsc::Sender<ManagerCommand>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RingTarget {
-    Left,
-    Right,
-    Both,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingConfirmation {
-    StartRing(RingTarget),
-}
-
-struct EarNative {
-    models: HashMap<String, ModelInfo>,
-    sku_map: HashMap<String, String>,
-    state: AppState,
-    discovered_devices: Vec<(String, String)>,
-    connected_device: Option<ConnectedDevice>,
-    initial_data_load: Option<InitialDataLoad>,
-    loading_frame: usize,
-    cmd_tx: Option<mpsc::Sender<ManagerCommand>>,
-    operation_id: u8,
-    pending_confirmation: Option<PendingConfirmation>,
-}
-
-#[derive(Debug, Clone)]
-enum AppState {
-    Disconnected,
-    Connecting(String),
-    Identifying(String),
-    Connected(ModelInfo),
-    Error(String),
-}
-
-struct ConnectedDevice {
-    model: ModelInfo,
-    battery_left: Option<u8>,
-    battery_right: Option<u8>,
-    battery_case: Option<u8>,
-    anc_status: u8,
-    eq_mode: EqMode,
-    eq_preset: u8,
-    advanced_eq_enabled: bool,
-    bass_level: u8,
-    bass_enhance_enabled: bool,
-    ringing_left: bool,
-    ringing_right: bool,
-    in_ear_enabled: bool,
-    latency_low: bool,
-    personalized_anc_enabled: bool,
-    firmware_version: String,
-    custom_eq: [f32; 3],
-    ear_tip_left: Option<u8>,
-    ear_tip_right: Option<u8>,
-    ear_tip_test_running: bool,
-}
-
-struct InitialDataLoad {
-    battery: bool,
-    anc: bool,
-    eq: bool,
-    personalized_anc: bool,
-    in_ear: bool,
-    latency: bool,
-    enhanced_bass: bool,
-    custom_eq: bool,
-    require_anc: bool,
-    require_personalized_anc: bool,
-}
-
-impl InitialDataLoad {
-    fn for_model(model: &ModelInfo) -> Self {
-        Self {
-            battery: false,
-            anc: false,
-            eq: false,
-            personalized_anc: false,
-            in_ear: false,
-            latency: false,
-            enhanced_bass: false,
-            custom_eq: model.base == "B181",
-            require_anc: model.is_anc,
-            require_personalized_anc: EarNative::supports_personalized_anc(model),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.battery
-            && self.eq
-            && (!self.require_personalized_anc || self.personalized_anc)
-            && self.in_ear
-            && self.latency
-            && self.enhanced_bass
-            && self.custom_eq
-            && (!self.require_anc || self.anc)
-    }
-}
-
 impl Default for EarNative {
     fn default() -> Self {
         Self {
             models: get_models(),
             sku_map: get_sku_map(),
+            active_model_assets_ready: true,
             state: AppState::Disconnected,
             discovered_devices: Vec::new(),
             connected_device: None,
@@ -182,11 +136,11 @@ impl EarNative {
         (Self::default(), Task::none())
     }
 
-    fn eq_command_for_model(model: &ModelInfo) -> u16 {
+    fn eq_command_for_model(model: &ModelInfo) -> crate::protocol::PacketCommand {
         if model.base == "B172" || model.base == "B168" {
-            commands::SET_LISTENING_MODE
+            PacketCommand::SetListeningMode
         } else {
-            commands::SET_EQ
+            PacketCommand::SetEq
         }
     }
 
@@ -376,6 +330,9 @@ impl EarNative {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ActiveModelAssetsPreloaded => {
+                self.active_model_assets_ready = true;
+            }
             Message::Ready(tx) => self.cmd_tx = Some(tx),
             Message::LoadingTick => {
                 self.loading_frame = (self.loading_frame + 1) % 4;
@@ -392,6 +349,7 @@ impl EarNative {
                 BluetoothEvent::Error(err) => {
                     log::error!("Bluetooth error event: {}", err);
                     self.state = AppState::Error(err.clone());
+                    self.active_model_assets_ready = true;
                     self.connected_device = None;
                     self.initial_data_load = None;
                     self.loading_frame = 0;
@@ -418,6 +376,7 @@ impl EarNative {
                     self.connected_device = Some(ConnectedDevice {
                         model: initial_model,
                         battery_left: None,
+                        sku_attempts: 0,
                         battery_right: None,
                         battery_case: None,
                         anc_status: 1,
@@ -439,14 +398,15 @@ impl EarNative {
                     });
 
                     return Task::batch(vec![
-                        self.send_delayed_command(commands::READ_SKU, vec![], 100),
-                        self.send_delayed_command(16392, vec![], 300),
-                        self.send_delayed_command(57352, vec![], 500),
-                        self.send_delayed_command(commands::READ_FIRMWARE, vec![], 700),
+                        self.send_delayed_command(PacketCommand::ReadSku, vec![], 100),
+                        self.send_delayed_command(PacketCommand::ReadSkuAlt, vec![], 300),
+                        self.send_delayed_command(PacketCommand::RespSku, vec![], 500),
+                        self.send_delayed_command(PacketCommand::ReadFirmware, vec![], 700),
                     ]);
                 }
-                BluetoothEvent::Disconnected(_) => {
+                BluetoothEvent::Disconnected => {
                     self.state = AppState::Disconnected;
+                    self.active_model_assets_ready = true;
                     self.connected_device = None;
                     self.initial_data_load = None;
                     self.loading_frame = 0;
@@ -456,11 +416,13 @@ impl EarNative {
             },
             Message::Connect(addr) => {
                 self.state = AppState::Connecting("initializing".to_string());
+                self.active_model_assets_ready = true;
                 self.loading_frame = 0;
                 return self.send_manager_command(ManagerCommand::Connect(addr));
             }
             Message::Disconnect => {
                 self.state = AppState::Disconnected;
+                self.active_model_assets_ready = true;
                 self.connected_device = None;
                 self.initial_data_load = None;
                 self.loading_frame = 0;
@@ -479,7 +441,7 @@ impl EarNative {
                         6 => 0x04,
                         _ => 0x05,
                     };
-                    return self.send_command(commands::SET_ANC, vec![0x01, proto, 0x00]);
+                    return self.send_command(PacketCommand::SetAnc, vec![0x01, proto, 0x00]);
                 }
             }
             Message::SetEQ(m) => {
@@ -495,7 +457,7 @@ impl EarNative {
                         if EarNative::supports_advanced_eq(&d.model) {
                             return Task::batch(vec![
                                 self.send_command(
-                                    commands::SET_ADVANCED_EQ_ENABLED,
+                                    PacketCommand::SetAdvancedEqEnabled,
                                     vec![0x00, 0x00],
                                 ),
                                 self.send_command(command, payload),
@@ -510,7 +472,7 @@ impl EarNative {
                     if EarNative::supports_advanced_eq(&d.model) {
                         d.advanced_eq_enabled = enabled;
                         return self.send_command(
-                            commands::SET_ADVANCED_EQ_ENABLED,
+                            PacketCommand::SetAdvancedEqEnabled,
                             vec![if enabled { 0x01 } else { 0x00 }, 0x00],
                         );
                     }
@@ -526,7 +488,7 @@ impl EarNative {
                     ]);
                 }
                 if let Some(p) = payload {
-                    return self.send_command(commands::SET_ENHANCED_BASS, p);
+                    return self.send_command(PacketCommand::SetEnhancedBass, p);
                 }
             }
             Message::ToggleBassEnhance(e) => {
@@ -536,7 +498,7 @@ impl EarNative {
                     payload = Some(vec![if e { 0x01 } else { 0x00 }, d.bass_level * 2]);
                 }
                 if let Some(p) = payload {
-                    return self.send_command(commands::SET_ENHANCED_BASS, p);
+                    return self.send_command(PacketCommand::SetEnhancedBass, p);
                 }
             }
             Message::RequestRing(target) => {
@@ -547,7 +509,7 @@ impl EarNative {
                 if let Some(d) = &mut self.connected_device {
                     EarNative::set_ringing_state(d, target, false);
                     request = Some((
-                        commands::SET_RING_BUDS,
+                        PacketCommand::SetRingBuds,
                         EarNative::ring_buds_payload(&d.model, target, false),
                     ));
                 }
@@ -563,7 +525,7 @@ impl EarNative {
                     if let Some(d) = &mut self.connected_device {
                         EarNative::set_ringing_state(d, target, true);
                         request = Some((
-                            commands::SET_RING_BUDS,
+                            PacketCommand::SetRingBuds,
                             EarNative::ring_buds_payload(&d.model, target, true),
                         ));
                     }
@@ -580,7 +542,7 @@ impl EarNative {
                     if EarNative::supports_personalized_anc(&d.model) {
                         d.personalized_anc_enabled = enabled;
                         return self.send_command(
-                            commands::SET_PERSONALIZED_ANC,
+                            PacketCommand::SetPersonalizedAnc,
                             vec![if enabled { 0x01 } else { 0x00 }],
                         );
                     }
@@ -592,7 +554,7 @@ impl EarNative {
                         d.ear_tip_left = None;
                         d.ear_tip_right = None;
                         d.ear_tip_test_running = true;
-                        return self.send_command(commands::START_EAR_FIT_TEST, vec![0x01]);
+                        return self.send_command(PacketCommand::StartEarFitTest, vec![0x01]);
                     }
                 }
             }
@@ -607,7 +569,7 @@ impl EarNative {
                 if let Some(d) = &mut self.connected_device {
                     d.in_ear_enabled = e;
                     return self.send_command(
-                        commands::SET_IN_EAR,
+                        PacketCommand::SetInEar,
                         vec![0x01, 0x01, if e { 0x01 } else { 0x00 }],
                     );
                 }
@@ -616,7 +578,7 @@ impl EarNative {
                 if let Some(d) = &mut self.connected_device {
                     d.latency_low = e;
                     return self.send_command(
-                        commands::SET_LATENCY,
+                        PacketCommand::SetLatency,
                         vec![if e { 0x01 } else { 0x02 }, 0x00],
                     );
                 }
@@ -697,24 +659,11 @@ impl EarNative {
                     return self.send_custom_eq_commands(custom_eq);
                 }
             }
-            Message::SendCustomEQ => {
-                let mut payload = None;
-                if let Some(d) = &mut self.connected_device {
-                    if EarNative::supports_custom_eq(&d.model) {
-                        d.eq_mode = EqMode::Custom;
-                        d.eq_preset = if matches!(d.model.base.as_str(), "B172" | "B168") {
-                            6
-                        } else {
-                            5
-                        };
-                        d.advanced_eq_enabled = false;
-                        payload = Some(d.custom_eq);
-                    }
-                }
-                if let Some(custom_eq) = payload {
-                    return self.send_custom_eq_commands(custom_eq);
-                }
+
+            Message::TrayIconClicked => {
+                log::info!("tray icon clicked");
             }
+
             _ => {}
         }
         Task::none()
@@ -833,15 +782,13 @@ impl EarNative {
             })
             .into(),
             AppState::Connected(model) => {
-                if self.initial_data_load.is_some() {
+                if self.initial_data_load.is_some() || !self.active_model_assets_ready {
                     self.loading_view("loading headphone data", model.name.to_lowercase())
                 } else if let Some(device) = &self.connected_device {
                     let device_images: Element<'_, Message> =
                         if !model.duo_img.is_empty() {
                             row![container(
-                                image::<image::Handle>(image::Handle::from_path(
-                                    model.duo_img.clone()
-                                ),)
+                                image::<image::Handle>(embedded_image_handle(&model.duo_img),)
                                 .width(260)
                                 .filter_method(image::FilterMethod::Linear)
                             )]
@@ -850,23 +797,17 @@ impl EarNative {
                         } else {
                             row![
                                 container(
-                                    image::<image::Handle>(image::Handle::from_path(
-                                        model.left_img.clone()
-                                    ),)
+                                    image::<image::Handle>(embedded_image_handle(&model.left_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
                                 ),
                                 container(
-                                    image::<image::Handle>(image::Handle::from_path(
-                                        model.case_img.clone()
-                                    ),)
+                                    image::<image::Handle>(embedded_image_handle(&model.case_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
                                 ),
                                 container(
-                                    image::<image::Handle>(image::Handle::from_path(
-                                        model.right_img.clone()
-                                    ),)
+                                    image::<image::Handle>(embedded_image_handle(&model.right_img),)
                                     .width(90)
                                     .filter_method(image::FilterMethod::Linear)
                                 ),
@@ -1524,7 +1465,11 @@ impl EarNative {
             .into()
     }
 
-    fn send_command(&mut self, command: u16, payload: Vec<u8>) -> Task<Message> {
+    fn send_command(
+        &mut self,
+        command: crate::protocol::PacketCommand,
+        payload: Vec<u8>,
+    ) -> Task<Message> {
         self.send_delayed_command(command, payload, 0)
     }
 
@@ -1541,17 +1486,6 @@ impl EarNative {
             }
         }
         b
-    }
-
-    fn from_format_float_for_eq(mut bytes: [u8; 4]) -> f32 {
-        bytes.reverse();
-
-        if bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && (bytes[3] & 0x80) != 0 {
-            bytes[3] &= 0x7f;
-            -f32::from_be_bytes(bytes)
-        } else {
-            f32::from_be_bytes(bytes)
-        }
     }
 
     fn supports_custom_eq(model: &ModelInfo) -> bool {
@@ -1589,7 +1523,7 @@ impl EarNative {
 
     fn send_custom_eq_commands(&mut self, custom_eq: [f32; 3]) -> Task<Message> {
         self.send_command(
-            commands::SET_CUSTOM_EQ,
+            PacketCommand::SetCustomEq,
             EarNative::build_custom_eq_payload(custom_eq),
         )
     }
@@ -1628,38 +1562,47 @@ impl EarNative {
     fn start_initial_data_load(&mut self, model: ModelInfo) -> Task<Message> {
         self.state = AppState::Connected(model.clone());
         self.initial_data_load = Some(InitialDataLoad::for_model(&model));
+        self.active_model_assets_ready = false;
 
         if let Some(device) = &mut self.connected_device {
             device.model = model.clone();
         }
 
+        let asset_model = model.clone();
+
         Task::batch(vec![
-            self.send_delayed_command(commands::READ_BATTERY, vec![], 100),
-            self.send_delayed_command(commands::READ_ANC, vec![], 300),
+            Task::perform(
+                async move {
+                    preload_model_images(std::iter::once(&asset_model));
+                },
+                |_| Message::ActiveModelAssetsPreloaded,
+            ),
+            self.send_delayed_command(PacketCommand::ReadBattery, vec![], 100),
+            self.send_delayed_command(PacketCommand::ReadAnc, vec![], 300),
             self.send_delayed_command(
                 if model.base == "B172" || model.base == "B168" {
-                    commands::READ_LISTENING_MODE
+                    PacketCommand::ReadListeningMode
                 } else {
-                    commands::READ_EQ
+                    PacketCommand::ReadEq
                 },
                 vec![],
                 500,
             ),
             if EarNative::supports_personalized_anc(&model) {
-                self.send_delayed_command(commands::READ_PERSONALIZED_ANC, vec![], 650)
+                self.send_delayed_command(PacketCommand::ReadPersonalizedAnc, vec![], 650)
             } else {
                 Task::none()
             },
-            self.send_delayed_command(commands::READ_IN_EAR, vec![], 700),
-            self.send_delayed_command(commands::READ_LATENCY, vec![], 900),
-            self.send_delayed_command(commands::READ_ENHANCED_BASS, vec![], 1100),
+            self.send_delayed_command(PacketCommand::ReadInEar, vec![], 700),
+            self.send_delayed_command(PacketCommand::ReadLatency, vec![], 900),
+            self.send_delayed_command(PacketCommand::ReadEnhancedBass, vec![], 1100),
             if EarNative::supports_custom_eq(&model) {
-                self.send_delayed_command(commands::READ_ADVANCED_EQ, vec![], 1300)
+                self.send_delayed_command(PacketCommand::ReadAdvancedEq, vec![], 1300)
             } else {
                 Task::none()
             },
             if EarNative::supports_custom_eq(&model) {
-                self.send_delayed_command(commands::READ_CUSTOM_EQ, vec![], 1500)
+                self.send_delayed_command(PacketCommand::ReadCustomEq, vec![], 1500)
             } else {
                 Task::none()
             },
@@ -1683,7 +1626,7 @@ impl EarNative {
 
     fn send_delayed_command(
         &mut self,
-        command: u16,
+        command: crate::protocol::PacketCommand,
         payload: Vec<u8>,
         delay_ms: u64,
     ) -> Task<Message> {
@@ -1699,7 +1642,7 @@ impl EarNative {
                     let _ = tx.send(ManagerCommand::SendPacket(packet.clone())).await;
                     packet
                 },
-                Message::CommandSent,
+                |_| Message::CommandSent,
             );
         }
         Task::none()
@@ -1712,7 +1655,7 @@ impl EarNative {
                 async move {
                     let _ = tx.send(command).await;
                 },
-                |_| Message::CommandSent(Packet::new(0, vec![], 0)),
+                |_| Message::CommandSent,
             );
         }
         Task::none()
@@ -1743,151 +1686,112 @@ impl EarNative {
             )
         });
 
-        if matches!(
+        let tray = Subscription::run(tray_event_stream);
+
+        let is_loading = matches!(
             self.state,
             AppState::Connecting(_) | AppState::Identifying(_)
-        ) || self.initial_data_load.is_some()
-        {
-            Subscription::batch(vec![
-                bluetooth,
+        ) || self.initial_data_load.is_some() || !self.active_model_assets_ready;
+
+        let mut subs = vec![bluetooth, tray];
+
+        if is_loading {
+            subs.push(
                 time::every(std::time::Duration::from_millis(120)).map(|_| Message::LoadingTick),
-            ])
-        } else {
-            bluetooth
+            );
         }
+
+        Subscription::batch(subs)
     }
 
     fn handle_packet(&mut self, packet: Packet) -> Task<Message> {
-        log::info!(
-            "Received packet: cmd=0x{:04x}, cmd-decimal={}, payload={:02x?}",
-            packet.command,
-            packet.command,
-            packet.payload
-        );
+        let parsed = packet.parse();
 
-        match packet.command {
-            // read SKU / model ID
-            commands::READ_SKU | 16392 | 57352 => {
-                if let AppState::Identifying(name) = &self.state {
-                    let sku = if packet.payload.len() >= 2 {
-                        format!("{:02x}", packet.payload[1])
-                    } else if !packet.payload.is_empty() {
-                        format!("{:02x}", packet.payload[0])
-                    } else {
-                        "unknown".to_string()
-                    };
+        if let ParsedResponse::Sku(sku) = parsed.clone() {
+            if let AppState::Identifying(name) = &self.state {
+                log::info!("Received SKU: {}", sku);
 
-                    log::info!("Received SKU: {}", sku);
+                if sku == "unknown" {
+                    if let Some(dev) = &mut self.connected_device {
+                        if dev.sku_attempts < 3 {
+                            dev.sku_attempts = dev.sku_attempts.saturating_add(1);
+                            log::warn!(
+                                "SKU unknown, retrying read (attempt {}/3)",
+                                dev.sku_attempts
+                            );
 
-                    let model_key = self
-                        .sku_map
-                        .get(&sku)
-                        .cloned()
-                        .unwrap_or_else(|| self.inferred_model_key(name));
-
-                    let model = self.models.get(&model_key).unwrap().clone();
-                    log::info!(
-                        "Identified model: {} ({}) via SKU: {}",
-                        model.name,
-                        model.base,
-                        sku
-                    );
-
-                    return self.start_initial_data_load(model);
+                            return Task::batch(vec![self.send_delayed_command(
+                                PacketCommand::ReadSku,
+                                vec![],
+                                300,
+                            )]);
+                        } else {
+                            log::warn!("SKU unknown after retries, falling back to inference");
+                        }
+                    }
                 }
+
+                let model_key = self
+                    .sku_map
+                    .get(&sku)
+                    .cloned()
+                    .unwrap_or_else(|| self.inferred_model_key(name));
+
+                let model = self.models.get(&model_key).unwrap().clone();
+                log::info!(
+                    "Identified model: {} ({}) via SKU: {}",
+                    model.name,
+                    model.base,
+                    sku
+                );
+
+                return self.start_initial_data_load(model);
             }
-            _ => {}
         }
 
         if let Some(device) = &mut self.connected_device {
-            match packet.command {
-                // read battery
-                49159 | 57345 | 16391 => {
-                    let p = packet.payload.clone();
-                    if p.len() >= 1 {
-                        for i in 0..p[0] as usize {
-                            if p.len() >= 3 + (i * 2) {
-                                let val = p[2 + (i * 2)] & 127;
-                                match p[1 + (i * 2)] {
-                                    2 => device.battery_left = Some(val),
-                                    3 => device.battery_right = Some(val),
-                                    4 => device.battery_case = Some(val),
-                                    _ => {}
-                                }
-                            }
-                        }
+            match parsed {
+                ParsedResponse::Battery(b) => {
+                    device.battery_left = b.left.map(|s| s.level);
+                    device.battery_right = b.right.map(|s| s.level);
+                    device.battery_case = b.case.map(|s| s.level);
 
-                        log::info!(
-                            "Parsed battery status - Left: {:?}%, Right: {:?}%, Case: {:?}%",
-                            device.battery_left,
-                            device.battery_right,
-                            device.battery_case
-                        );
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for battery status: {}",
-                            packet.payload.len()
-                        );
-                    }
+                    log::info!(
+                        "Parsed battery status - Left: {:?}%, Right: {:?}%, Case: {:?}%",
+                        device.battery_left,
+                        device.battery_right,
+                        device.battery_case
+                    );
                     self.mark_initial_data_loaded(|load| load.battery = true);
                 }
-                // read anc mode
-                49182 | 57347 | 16414 => {
-                    if packet.payload.len() >= 2 {
-                        let val = packet.payload[1];
-                        device.anc_status = match val {
-                            0x05 => 1,
-                            0x07 => 2,
-                            0x03 => 3,
-                            0x01 => 4,
-                            0x02 => 5,
-                            0x04 => 6,
-                            _ => device.anc_status,
-                        };
-
-                        log::info!("Parsed ANC status: {}", device.anc_status);
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for ANC status: {}",
-                            packet.payload.len()
-                        );
-                    }
+                ParsedResponse::Anc(mode) => {
+                    device.anc_status = match mode {
+                        AncMode::Off => 1,
+                        AncMode::Transparent => 2,
+                        AncMode::NcLow => 3,
+                        AncMode::NcHigh => 4,
+                        AncMode::NcMid => 5,
+                        AncMode::NcAdaptive => 6,
+                    };
+                    log::info!("Parsed ANC status: {}", device.anc_status);
                     self.mark_initial_data_loaded(|load| load.anc = true);
                 }
-                // read equaliser mode or listening mode
-                49183 | 16415 | 16464 | 49232 => {
-                    if !packet.payload.is_empty() {
-                        device.eq_preset = packet.payload[0];
-                        device.eq_mode = EarNative::eq_mode_from_raw(packet.payload[0]);
-                        device.advanced_eq_enabled = false;
-
-                        log::info!("Parsed EQ/Listening mode raw: {}", device.eq_preset);
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for EQ/Listening mode: {}",
-                            packet.payload.len()
-                        );
-                    }
+                ParsedResponse::Eq { mode: _, preset } => {
+                    device.eq_preset = preset;
+                    device.eq_mode = EarNative::eq_mode_from_raw(preset);
+                    device.advanced_eq_enabled = false;
+                    log::info!("Parsed EQ/Listening mode raw: {}", device.eq_preset);
                     self.mark_initial_data_loaded(|load| load.eq = true);
                 }
-                commands::READ_PERSONALIZED_ANC | commands::RESP_PERSONALIZED_ANC => {
-                    if !packet.payload.is_empty() {
-                        device.personalized_anc_enabled = packet.payload[0] == 0x01;
-                    }
+                ParsedResponse::PersonalizedAnc(enabled) => {
+                    device.personalized_anc_enabled = enabled;
                     self.mark_initial_data_loaded(|load| load.personalized_anc = true);
                 }
-                // read advanced eq status
-                49228 | 16460 => {
-                    if !packet.payload.is_empty() {
-                        device.advanced_eq_enabled = packet.payload[0] == 0x01;
-                    }
+                ParsedResponse::AdvancedEq(enabled) => {
+                    device.advanced_eq_enabled = enabled;
                 }
-                // read firmware version
-                49218 | 16450 => {
-                    device.firmware_version = String::from_utf8_lossy(&packet.payload)
-                        .trim_matches(char::from(0))
-                        .trim()
-                        .to_lowercase();
+                ParsedResponse::Firmware(s) => {
+                    device.firmware_version = s.trim_matches(char::from(0)).trim().to_lowercase();
 
                     if let AppState::Identifying(name) = &self.state {
                         log::info!("Identifying via Firmware fallback for: {}", name);
@@ -1903,86 +1807,37 @@ impl EarNative {
                         return self.start_initial_data_load(model);
                     }
                 }
-                // read in-ear detect status
-                49166 | 16398 => {
-                    if packet.payload.len() >= 3 {
-                        device.in_ear_enabled = packet.payload[2] == 0x01;
-
-                        log::info!("Parsed in-ear detect status: {}", device.in_ear_enabled);
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for in-ear status: {}",
-                            packet.payload.len()
-                        );
-                    }
+                ParsedResponse::InEar(b) => {
+                    device.in_ear_enabled = b;
+                    log::info!("Parsed in-ear detect status: {}", device.in_ear_enabled);
                     self.mark_initial_data_loaded(|load| load.in_ear = true);
                 }
-                // read low latency mode status
-                49217 | 16449 => {
-                    if !packet.payload.is_empty() {
-                        device.latency_low = packet.payload[0] == 0x01;
-
-                        log::info!("Parsed latency mode status: {}", device.latency_low);
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for latency status: {}",
-                            packet.payload.len()
-                        );
-                    }
+                ParsedResponse::Latency(b) => {
+                    device.latency_low = b;
+                    log::info!("Parsed latency mode status: {}", device.latency_low);
                     self.mark_initial_data_loaded(|load| load.latency = true);
                 }
-                // read bass boost level
-                49230 | commands::RESP_ENHANCED_BASS => {
-                    if packet.payload.len() >= 2 {
-                        device.bass_enhance_enabled = packet.payload[0] == 0x01;
-                        device.bass_level = packet.payload[1] / 2;
-
-                        log::info!(
-                            "Parsed bass boost status: enabled={}, level={}",
-                            device.bass_enhance_enabled,
-                            device.bass_level
-                        );
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for bass boost status: {}",
-                            packet.payload.len()
-                        );
-                    }
+                ParsedResponse::EnhancedBass { enabled, level } => {
+                    device.bass_enhance_enabled = enabled;
+                    device.bass_level = level;
+                    log::info!(
+                        "Parsed bass boost status: enabled={}, level={}",
+                        device.bass_enhance_enabled,
+                        device.bass_level
+                    );
                     self.mark_initial_data_loaded(|load| load.enhanced_bass = true);
                 }
-                // read custom eq response
-                49220 | 16452 => {
-                    if packet.payload.len() >= 45 && EarNative::supports_custom_eq(&device.model) {
-                        let mut values = [0.0f32; 3];
-                        for (index, slot) in values.iter_mut().enumerate() {
-                            let base = 6 + (index * 13);
-                            let bytes = [
-                                packet.payload[base],
-                                packet.payload[base + 1],
-                                packet.payload[base + 2],
-                                packet.payload[base + 3],
-                            ];
-                            *slot = EarNative::from_format_float_for_eq(bytes)
-                                .round()
-                                .clamp(-6.0, 6.0);
-                        }
-                        // JS reorders to [level[2], level[0], level[1]]
-                        device.custom_eq = [values[2], values[0], values[1]];
+                ParsedResponse::CustomEq(values) => {
+                    if EarNative::supports_custom_eq(&device.model) {
+                        device.custom_eq = values;
                         log::info!("Parsed custom EQ: {:?}", device.custom_eq);
-                    } else {
-                        log::warn!(
-                            "Unexpected payload length for custom EQ: {}",
-                            packet.payload.len()
-                        );
                     }
                     self.mark_initial_data_loaded(|load| load.custom_eq = true);
                 }
-                commands::RESP_EAR_FIT_TEST => {
-                    if packet.payload.len() >= 2 {
-                        device.ear_tip_left = Some(packet.payload[0]);
-                        device.ear_tip_right = Some(packet.payload[1]);
-                        device.ear_tip_test_running = false;
-                    }
+                ParsedResponse::EarFitTest { left, right } => {
+                    device.ear_tip_left = Some(left);
+                    device.ear_tip_right = Some(right);
+                    device.ear_tip_test_running = false;
                 }
                 _ => {}
             }

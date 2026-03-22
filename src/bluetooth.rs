@@ -1,10 +1,12 @@
 use crate::protocol::Packet;
 
+const MAX_RX_BUF: usize = 8192;
+
 #[derive(Debug, Clone)]
 pub enum BluetoothEvent {
     DeviceDiscovered(String, String),
     Connected(String),
-    Disconnected(String),
+    Disconnected,
     PacketReceived(Packet),
     Error(String),
 }
@@ -14,6 +16,43 @@ pub enum ManagerCommand {
     Connect(String),
     Disconnect,
     SendPacket(Packet),
+}
+
+fn drain_packets(buf: &mut Vec<u8>, mut emit: impl FnMut(Packet)) {
+    if buf.len() > MAX_RX_BUF {
+        log::warn!("rx_buf exceeded {} bytes, discarding tail", MAX_RX_BUF);
+        buf.truncate(MAX_RX_BUF);
+    }
+
+    let mut pos = 0;
+    while pos < buf.len() {
+        if buf[pos] != 0x55 {
+            pos += 1;
+            continue;
+        }
+
+        if buf.len() - pos < 10 {
+            break;
+        }
+
+        let payload_len = buf[pos + 5] as usize;
+        let total_len = 10 + payload_len;
+
+        if buf.len() - pos < total_len {
+            break;
+        }
+
+        if let Some(packet) = Packet::from_bytes(&buf[pos..pos + total_len]) {
+            emit(packet);
+            pos += total_len;
+        } else {
+            pos += 1;
+        }
+    }
+
+    if pos > 0 {
+        buf.drain(..pos);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -84,15 +123,25 @@ mod platform {
 
         pub async fn run(mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut current_stream: Option<rfcomm::Stream> = None;
-            let mut buffer = [0u8; 1024];
+            let mut current_addr = String::new();
+            let mut buffer = [0u8; 4096];
             let mut rx_buf = Vec::new();
 
             loop {
                 tokio::select! {
                     Some(cmd) = self.cmd_rx.recv() => {
                         match cmd {
-                            ManagerCommand::Connect(addr) => {
-                                let addr: Address = addr.parse().unwrap();
+                            ManagerCommand::Connect(addr_str) => {
+                                let addr: Address = match addr_str.parse() {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        let _ = self.tx.send(BluetoothEvent::Error(format!("Invalid address '{}': {}", addr_str, e))).await;
+                                        continue;
+                                    }
+                                };
+                                current_stream = None;
+                                rx_buf.clear();
+                                current_addr = addr_str;
                                 match self.connect(addr).await {
                                     Ok(stream) => { current_stream = Some(stream); }
                                     Err(e) => {
@@ -101,16 +150,17 @@ mod platform {
                                 }
                             }
                             ManagerCommand::Disconnect => {
-                                current_stream = None;
-                                rx_buf.clear();
+                                let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                             }
                             ManagerCommand::SendPacket(packet) => {
                                 let bytes = packet.to_bytes();
                                 if let Some(stream) = &mut current_stream {
                                     if let Err(e) = stream.write_all(&bytes).await {
+                                        log::error!("BT write error: {}", e);
                                         let _ = self.tx.send(BluetoothEvent::Error(format!("Write err: {}", e))).await;
                                         current_stream = None;
                                         rx_buf.clear();
+                                        let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                                     }
                                 }
                             }
@@ -127,35 +177,20 @@ mod platform {
                             Ok(0) => {
                                 current_stream = None;
                                 rx_buf.clear();
-                                let _ = self.tx.send(BluetoothEvent::Disconnected(String::new())).await;
+                                let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                             }
                             Ok(n) => {
                                 rx_buf.extend_from_slice(&buffer[..n]);
-
-                                while rx_buf.len() >= 10 {
-                                    if rx_buf[0] != 0x55 {
-                                        rx_buf.remove(0);
-                                        continue;
-                                    }
-
-                                    let payload_len = rx_buf[5] as usize;
-                                    let total_len = 10 + payload_len;
-
-                                    if rx_buf.len() >= total_len {
-                                        if let Some(packet) = Packet::from_bytes(&rx_buf[..total_len]) {
-                                            let _ = self.tx.send(BluetoothEvent::PacketReceived(packet)).await;
-                                            rx_buf.drain(..total_len);
-                                        } else {
-                                            rx_buf.remove(0);
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
+                                let tx = &self.tx;
+                                drain_packets(&mut rx_buf, |packet| {
+                                    let _ = tx.try_send(BluetoothEvent::PacketReceived(packet));
+                                });
                             }
                             Err(e) => {
+                                log::error!("BT read error: {}", e);
                                 current_stream = None;
                                 rx_buf.clear();
+                                let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                                 let _ = self.tx.send(BluetoothEvent::Error(format!("Read err: {}", e))).await;
                             }
                         }
@@ -259,7 +294,8 @@ mod platform {
         pub async fn run(mut self) -> std::result::Result<(), Box<dyn StdError + Send + Sync>> {
             let mut current_socket: Option<StreamSocket> = None;
             let mut current_writer: Option<DataWriter> = None;
-            let (read_tx, mut read_rx) = mpsc::channel::<Vec<u8>>(100);
+            let mut reader_abort: Option<tokio::task::AbortHandle> = None;
+            let (read_tx, mut read_rx) = mpsc::channel::<Option<Vec<u8>>>(100);
             let mut rx_buf: Vec<u8> = Vec::new();
 
             loop {
@@ -267,6 +303,9 @@ mod platform {
                     Some(cmd) = self.cmd_rx.recv() => {
                         match cmd {
                             ManagerCommand::Connect(device_id) => {
+                                if let Some(handle) = reader_abort.take() {
+                                    handle.abort();
+                                }
                                 if let Some(socket) = current_socket.take() {
                                     let _ = socket.Close();
                                 }
@@ -279,77 +318,100 @@ mod platform {
                                         current_writer = Some(writer);
 
                                         let read_tx_clone = read_tx.clone();
-                                        tokio::spawn(async move {
+                                        let handle = tokio::spawn(async move {
                                             loop {
-                                                match reader.LoadAsync(1024) {
+                                                match reader.LoadAsync(4096) {
                                                     Ok(op) => {
                                                         match op.await {
                                                             Ok(loaded) if loaded > 0 => {
                                                                 let mut buffer = vec![0u8; loaded as usize];
                                                                 if reader.ReadBytes(&mut buffer).is_ok() {
-                                                                    if read_tx_clone.send(buffer).await.is_err() {
+                                                                    if read_tx_clone.send(Some(buffer)).await.is_err() {
                                                                         break;
                                                                     }
+                                                                } else {
+                                                                    break;
                                                                 }
                                                             }
-                                                            Ok(_) => break,
-                                                            Err(_) => break,
+                                                            Ok(_) | Err(_) => {
+                                                                let _ = read_tx_clone.send(None).await;
+                                                                break;
+                                                            }
                                                         }
                                                     }
-                                                    Err(_) => break,
+                                                    Err(_) => {
+                                                        let _ = read_tx_clone.send(None).await;
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         });
+                                        reader_abort = Some(handle.abort_handle());
 
                                         let _ = self.tx.send(BluetoothEvent::Connected(device_id)).await;
                                     }
                                     Err(e) => {
-                                        log::error!("Connection Error: {}", e);
-                                        let _ = self.tx.send(BluetoothEvent::Error(format!("Connect error: {}", e))).await;
+                                        log::error!("BT connect error: {}", e);
+                                        let _ = self.tx.send(BluetoothEvent::Error(e.to_string())).await;
                                     }
                                 }
                             }
                             ManagerCommand::Disconnect => {
-                                if let Some(socket) = current_socket.take() { let _ = socket.Close(); }
+                                if let Some(handle) = reader_abort.take() {
+                                    handle.abort();
+                                }
+                                if let Some(socket) = current_socket.take() {
+                                    let _ = socket.Close();
+                                }
                                 current_writer = None;
                                 rx_buf.clear();
+                                let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                             }
                             ManagerCommand::SendPacket(packet) => {
                                 let bytes = packet.to_bytes();
                                 if let Some(writer) = &current_writer {
-                                    if writer.WriteBytes(&bytes).is_ok() {
-                                        if let Ok(async_op) = writer.StoreAsync() {
-                                            if async_op.await.is_ok() {
-                                                if let Ok(flush_op) = writer.FlushAsync() {
-                                                    let _ = flush_op.await;
-                                                }
-                                            }
+                                    let store_ok = if writer.WriteBytes(&bytes).is_ok() {
+                                        match writer.StoreAsync() {
+                                            Ok(op) => op.await.is_ok(),
+                                            Err(_) => false,
                                         }
+                                    } else {
+                                        false
+                                    };
+                                    if !store_ok {
+                                        log::error!("BT write failed, disconnecting");
+                                        if let Some(handle) = reader_abort.take() {
+                                            handle.abort();
+                                        }
+                                        if let Some(socket) = current_socket.take() {
+                                            let _ = socket.Close();
+                                        }
+                                        current_writer = None;
+                                        rx_buf.clear();
+                                        let _ = self.tx.send(BluetoothEvent::Error("Write failed".into())).await;
+                                        let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                                     }
                                 }
                             }
                         }
                     }
-                    Some(data) = read_rx.recv() => {
-                        rx_buf.extend_from_slice(&data);
-                        while rx_buf.len() >= 10 {
-                            if rx_buf[0] != 0x55 {
-                                rx_buf.remove(0);
-                                continue;
+                    Some(msg) = read_rx.recv() => {
+                        match msg {
+                            Some(data) => {
+                                rx_buf.extend_from_slice(&data);
+                                let tx = &self.tx;
+                                drain_packets(&mut rx_buf, |packet| {
+                                    let _ = tx.try_send(BluetoothEvent::PacketReceived(packet));
+                                });
                             }
-
-                            let payload_len = rx_buf[5] as usize;
-                            let total_len = 10 + payload_len;
-
-                            if rx_buf.len() >= total_len {
-                                if let Some(packet) = Packet::from_bytes(&rx_buf[..total_len]) {
-                                    let _ = self.tx.send(BluetoothEvent::PacketReceived(packet)).await;
-                                    rx_buf.drain(..total_len);
-                                } else {
-                                    rx_buf.remove(0);
+                            None => {
+                                reader_abort = None;
+                                if let Some(socket) = current_socket.take() {
+                                    let _ = socket.Close();
                                 }
-                            } else {
-                                break;
+                                current_writer = None;
+                                rx_buf.clear();
+                                let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                             }
                         }
                     }

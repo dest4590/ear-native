@@ -1,5 +1,14 @@
+use iced::widget::image;
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+#[derive(RustEmbed)]
+#[folder = "res/assets/"]
+struct EmbeddedAssets;
+
+static IMAGE_HANDLE_CACHE: OnceLock<Mutex<HashMap<String, image::Handle>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -12,156 +21,77 @@ pub struct ModelInfo {
     pub is_anc: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum DeviceId {
-    Left = 0x02,
-    Right = 0x03,
-    Case = 0x04,
-}
-
-impl DeviceId {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0x02 => Some(Self::Left),
-            0x03 => Some(Self::Right),
-            0x04 => Some(Self::Case),
-            _ => None,
-        }
+pub fn embedded_image_handle(asset_path: &str) -> image::Handle {
+    if asset_path.is_empty() {
+        return transparent_image_handle();
     }
-}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct BatteryStatus {
-    pub level: u8,
-    pub is_charging: bool,
-}
+    let cache = IMAGE_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DeviceBattery {
-    pub left: Option<BatteryStatus>,
-    pub right: Option<BatteryStatus>,
-    pub case: Option<BatteryStatus>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum AncMode {
-    Off = 0x05,
-    Transparent = 0x07,
-    NcLow = 0x03,
-    NcHigh = 0x01,
-    NcMid = 0x02,
-    NcAdaptive = 0x04,
-}
-
-impl AncMode {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0x05 => Some(Self::Off),
-            0x07 => Some(Self::Transparent),
-            0x03 => Some(Self::NcLow),
-            0x01 => Some(Self::NcHigh),
-            0x02 => Some(Self::NcMid),
-            0x04 => Some(Self::NcAdaptive),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum EqMode {
-    Balanced = 0,
-    MoreTreble = 1,
-    MoreBass = 2,
-    Voice = 3,
-    Custom = 6, // Advanced EQ
-}
-
-impl EqMode {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Balanced),
-            1 => Some(Self::MoreTreble),
-            2 => Some(Self::MoreBass),
-            3 => Some(Self::Voice),
-            6 => Some(Self::Custom),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum GestureType {
-    DoubleTap = 2,
-    TripleTap = 3,
-    TapAndHold = 7,
-    DoubleTapAndHold = 9,
-}
-
-impl GestureType {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            2 => Some(Self::DoubleTap),
-            3 => Some(Self::TripleTap),
-            7 => Some(Self::TapAndHold),
-            9 => Some(Self::DoubleTapAndHold),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GestureAction {
-    NoAction,
-    SkipBack,
-    SkipForward,
-    VoiceAssistant,
-    NoiseControl,
-    VolumeUp,
-    VolumeDown,
-    NoiseControlToggles(u8), // 20, 21, 22
-    Unknown(u8),
-}
-
-impl GestureAction {
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::NoAction,
-            8 => Self::SkipBack,
-            9 => Self::SkipForward,
-            11 => Self::VoiceAssistant,
-            10 => Self::NoiseControl,
-            18 => Self::VolumeUp,
-            19 => Self::VolumeDown,
-            20 | 21 | 22 => Self::NoiseControlToggles(value),
-            _ => Self::Unknown(value),
+    {
+        let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = cache.get(asset_path) {
+            return handle.clone();
         }
     }
 
-    pub fn to_u8(&self) -> u8 {
-        match self {
-            Self::NoAction => 1,
-            Self::SkipBack => 8,
-            Self::SkipForward => 9,
-            Self::VoiceAssistant => 11,
-            Self::NoiseControl => 10,
-            Self::VolumeUp => 18,
-            Self::VolumeDown => 19,
-            Self::NoiseControlToggles(v) => *v,
-            Self::Unknown(v) => *v,
+    let handle = decode_embedded_image_handle(asset_path);
+
+    {
+        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(asset_path.to_string(), handle.clone());
+    }
+
+    handle
+}
+
+pub fn preload_model_images<'a>(models: impl IntoIterator<Item = &'a ModelInfo>) {
+    let mut asset_paths = HashSet::new();
+
+    for model in models {
+        for asset_path in [&model.left_img, &model.case_img, &model.right_img, &model.duo_img] {
+            if !asset_path.is_empty() {
+                asset_paths.insert(asset_path.as_str());
+            }
         }
+    }
+
+    for asset_path in asset_paths {
+        let _ = embedded_image_handle(asset_path);
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Gesture {
-    pub device: DeviceId,
-    pub gesture_type: GestureType,
-    pub action: GestureAction,
+fn transparent_image_handle() -> image::Handle {
+    static TRANSPARENT_IMAGE_HANDLE: OnceLock<image::Handle> = OnceLock::new();
+
+    TRANSPARENT_IMAGE_HANDLE
+        .get_or_init(|| image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]))
+        .clone()
 }
+
+fn decode_embedded_image_handle(asset_path: &str) -> image::Handle {
+    let embedded_path = asset_path.trim_start_matches("res/assets/");
+
+    let Some(file) = EmbeddedAssets::get(embedded_path) else {
+        log::warn!("missing embedded asset: {}", asset_path);
+        return transparent_image_handle();
+    };
+
+    let decoded = match ::image::load_from_memory(file.data.as_ref()) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            log::error!("failed to decode embedded asset {}: {}", asset_path, error);
+            return transparent_image_handle();
+        }
+    };
+
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    image::Handle::from_rgba(width, height, rgba.into_raw())
+}
+
+
 
 pub fn get_models() -> HashMap<String, ModelInfo> {
     let mut m = HashMap::new();
