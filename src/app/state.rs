@@ -37,7 +37,6 @@ pub enum Message {
     ToggleLatency(bool),
     CommandSent,
     Ready(mpsc::Sender<ManagerCommand>),
-    TrayIconClicked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

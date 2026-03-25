@@ -1,4 +1,8 @@
-# ear (native)
+<h1>ear (native)</h1>
+
+<img src="./res/icon/logo.png" width="128" height="128" alt="ear logo" align="right">
+
+---
 
 https://github.com/user-attachments/assets/3bc42663-332d-465d-886e-3e60b27c935d
 

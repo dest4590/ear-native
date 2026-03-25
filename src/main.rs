@@ -1,7 +1,9 @@
-﻿use futures::{channel::mpsc::Sender, SinkExt};
+﻿use ::image::ImageFormat;
+use futures::SinkExt;
 use iced::{
     time,
     widget::{button, column, container, image, row, scrollable, text},
+    window::icon::from_file_data,
     Alignment, Border, Color, Element, Font, Length, Padding, Subscription, Task, Theme,
 };
 
@@ -55,67 +57,18 @@ struct EarNative {
     pending_confirmation: Option<PendingConfirmation>,
 }
 
-fn tray_event_stream() -> impl futures::Stream<Item = Message> + 'static {
-    iced::stream::channel(100, |mut output: Sender<Message>| async move {
-        use iced::futures::SinkExt;
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
-            let _ = tx.send(event);
-        }));
-
-        let mut last_click = Instant::now() - Duration::from_secs(1);
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                tray_icon::TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    ..
-                } => {
-                    if last_click.elapsed() < Duration::from_millis(120) {
-                        continue;
-                    }
-
-                    last_click = Instant::now();
-                    let _ = output.send(Message::TrayIconClicked).await;
-                }
-                _ => {}
-            }
-        }
-    })
-}
-
 pub fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let _tray_icon = {
-        let size = 32u32;
-        let cx = size as f32 / 2.0;
-        let cy = size as f32 / 2.0;
-        let r = size as f32 / 2.0 - 1.5;
-        let rgba: Vec<u8> = (0..size)
-            .flat_map(|y| {
-                (0..size).flat_map(move |x| {
-                    let dx = x as f32 - cx;
-                    let dy = y as f32 - cy;
-                    if (dx * dx + dy * dy).sqrt() <= r {
-                        [255u8, 255, 255, 255]
-                    } else {
-                        [0u8, 0, 0, 0]
-                    }
-                })
-            })
-            .collect();
-        tray_icon::TrayIconBuilder::new()
-            .with_tooltip("ear-native")
-            .with_icon(tray_icon::Icon::from_rgba(rgba, size, size).expect("tray icon rgba"))
-            .build()
-            .expect("failed to create tray icon")
-    };
-
     let mut settings = iced::window::Settings::default();
     settings.size = iced::Size::new(450.0, 700.0);
+    settings.icon = Some(
+        from_file_data(
+            include_bytes!("../res/icon/logo.png"),
+            Some(ImageFormat::Png),
+        )
+        .expect("Failed to load icon"),
+    );
 
     iced::application(EarNative::boot, EarNative::update, EarNative::view)
         .theme(EarNative::theme)
@@ -123,6 +76,7 @@ pub fn main() -> iced::Result {
         .font(include_bytes!("../res/fonts/Silkscreen-Regular.ttf").as_slice())
         .default_font(Font::with_name(APP_FONT_NAME))
         .window(settings)
+        .title("ear (native)")
         .run()
 }
 
@@ -453,7 +407,6 @@ impl EarNative {
                         return Task::none();
                     }
 
-                    // Apply change locally immediately and do not wait for device confirmation.
                     d.anc_status = l;
 
                     let proto = match l {
@@ -686,10 +639,6 @@ impl EarNative {
                 if let Some(custom_eq) = payload {
                     return self.send_custom_eq_commands(custom_eq);
                 }
-            }
-
-            Message::TrayIconClicked => {
-                log::info!("tray icon clicked");
             }
 
             _ => {}
@@ -1438,15 +1387,13 @@ impl EarNative {
             )
         });
 
-        let tray = Subscription::run(tray_event_stream);
-
         let is_loading = matches!(
             self.state,
             AppState::Connecting(_) | AppState::Identifying(_)
         ) || self.initial_data_load.is_some()
             || !self.active_model_assets_ready;
 
-        let mut subs = vec![bluetooth, tray];
+        let mut subs = vec![bluetooth];
 
         if is_loading {
             subs.push(
