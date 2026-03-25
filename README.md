@@ -1,6 +1,7 @@
-<h1>ear (native)</h1>
-
-<img src="./res/icon/logo.png" width="128" height="128" alt="ear logo" align="right">
+<p align="center">
+    <img src="./res/icon/logo.png" width="128" alt="ear logo">
+    <h1 align=center>ear (native)</h1>
+</p>
 
 ---
 
