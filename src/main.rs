@@ -58,7 +58,10 @@ struct EarNative {
 }
 
 pub fn main() -> iced::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let mut env_b =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    env_b.filter_module("iced_winit", log::LevelFilter::Off);
+    env_b.init();
 
     let mut settings = iced::window::Settings::default();
     settings.size = iced::Size::new(450.0, 700.0);
