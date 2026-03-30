@@ -202,8 +202,11 @@ impl BluetoothStream for LinuxBluetoothStream {
             Ok(Ok(read)) => Ok(StreamRead::Data(buffer[..read].to_vec())),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
-                println!("Read timed out, assuming stream is closed");
-                Ok(StreamRead::Closed)
+                // here we will ignore timeouts because it is happening on any commands (or just after connection)
+                // println!("Read timed out, assuming stream is closed");
+                // Ok(StreamRead::Closed)
+                // returning empty data
+                Ok(StreamRead::Data(Vec::new()))
             }
         }
     }
