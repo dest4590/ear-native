@@ -265,6 +265,17 @@ impl EarNative {
             Message::InitialDataLoadTimedOut => {
                 self.initial_data_load = None;
             }
+            Message::IdentificationTimeout => {
+                if let AppState::Identifying(name) = &self.state {
+                    log::warn!(
+                        "Identification timed out for {}, falling back to inference",
+                        name
+                    );
+                    let model_key = self.inferred_model_key(name);
+                    let model = self.models.get(&model_key).unwrap().clone();
+                    return self.start_initial_data_load(model);
+                }
+            }
             Message::Bluetooth(event) => match event {
                 BluetoothEvent::DeviceDiscovered(device) => {
                     let mut tasks = Vec::new();
@@ -318,11 +329,13 @@ impl EarNative {
 
                     let mut tasks = Vec::new();
                     if self.config.remember_connected_device(&addr) {
+                        log::debug!("Persisting config for connected device");
                         tasks.push(self.persist_config());
                     }
 
                     let initial_model_key = self.inferred_model_key(&name);
                     let initial_model = self.models.get(&initial_model_key).unwrap().clone();
+                    log::debug!("Inferred model: {}", initial_model.name);
 
                     self.connected_device = Some(ConnectedDevice {
                         id: addr.clone(),
@@ -369,11 +382,18 @@ impl EarNative {
                         }
                     }
 
+                    log::debug!("Sending SKU identification commands...");
                     tasks.extend(vec![
-                        self.send_delayed_command(PacketCommand::ReadSku, vec![], 100),
-                        self.send_delayed_command(PacketCommand::ReadSkuAlt, vec![], 300),
-                        self.send_delayed_command(PacketCommand::RespSku, vec![], 500),
-                        self.send_delayed_command(PacketCommand::ReadFirmware, vec![], 700),
+                        self.send_delayed_command(PacketCommand::ReadSku, vec![], 600),
+                        self.send_delayed_command(PacketCommand::ReadSkuAlt, vec![], 1000),
+                        self.send_delayed_command(PacketCommand::RespSku, vec![], 1400),
+                        self.send_delayed_command(PacketCommand::ReadFirmware, vec![], 1800),
+                        Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            },
+                            |_| Message::IdentificationTimeout,
+                        ),
                     ]);
 
                     return Task::batch(tasks);

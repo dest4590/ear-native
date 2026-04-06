@@ -84,6 +84,7 @@ impl BluetoothManager {
                             let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                         }
                         ManagerCommand::SendPacket(packet) => {
+                            log::debug!("Manager sending packet: {:?}", packet.command);
                             if let Some(stream) = &mut current_stream {
                                 if let Err(error) = stream.send(&packet).await {
                                     log::error!("BT write error: {}", error);
@@ -92,6 +93,8 @@ impl BluetoothManager {
                                     let _ = self.tx.send(BluetoothEvent::Error(format!("Write err: {}", error))).await;
                                     let _ = self.tx.send(BluetoothEvent::Disconnected).await;
                                 }
+                            } else {
+                                log::warn!("Attempted to send packet but no stream is active");
                             }
                         }
                     }

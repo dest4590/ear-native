@@ -140,7 +140,7 @@ impl BluetoothAdapter for LinuxBluetoothAdapter {
             if let Ok(socket) = rfcomm::Socket::new() {
                 let sa = rfcomm::SocketAddr::new(addr, channel);
                 if let Ok(Ok(_)) = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(300),
+                    tokio::time::Duration::from_millis(500),
                     socket.connect(sa),
                 )
                 .await
@@ -149,7 +149,7 @@ impl BluetoothAdapter for LinuxBluetoothAdapter {
                     open_channels.push(channel);
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
         if !open_channels.is_empty() {
@@ -160,12 +160,12 @@ impl BluetoothAdapter for LinuxBluetoothAdapter {
 
         info!("Targeting Channel {} (Nothing Protocol)", target_channel);
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
         let socket = rfcomm::Socket::new()?;
         let sa = rfcomm::SocketAddr::new(addr, target_channel);
 
-        let stream = tokio::time::timeout(tokio::time::Duration::from_secs(3), socket.connect(sa))
+        let stream = tokio::time::timeout(tokio::time::Duration::from_secs(5), socket.connect(sa))
             .await
             .map_err(|_| "Connection timed out during final handshake")??;
 
@@ -185,7 +185,7 @@ struct LinuxBluetoothStream {
 impl BluetoothStream for LinuxBluetoothStream {
     async fn send(&mut self, packet: &Packet) -> BluetoothResult<()> {
         let bytes = packet.to_bytes();
-        // log::info!("Sending bytes: {:02X?}", bytes);
+        log::debug!("Linux stream sending {} bytes", bytes.len());
         self.stream.write_all(&bytes).await?;
         Ok(())
     }
@@ -198,14 +198,24 @@ impl BluetoothStream for LinuxBluetoothStream {
         )
         .await
         {
-            Ok(Ok(0)) => Ok(StreamRead::Closed),
-            Ok(Ok(read)) => Ok(StreamRead::Data(buffer[..read].to_vec())),
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Ok(0)) => {
+                log::debug!("Linux stream closed by peer");
+                Ok(StreamRead::Closed)
+            }
+            Ok(Ok(read)) => {
+                log::debug!("Linux stream read {} bytes", read);
+                Ok(StreamRead::Data(buffer[..read].to_vec()))
+            }
+            Ok(Err(e)) => {
+                log::error!("Linux stream read error: {}", e);
+                Err(e.into())
+            }
             Err(_) => {
                 // here we will ignore timeouts because it is happening on any commands (or just after connection)
                 // println!("Read timed out, assuming stream is closed");
                 // Ok(StreamRead::Closed)
                 // returning empty data
+                log::trace!("Linux stream read timeout (expected)");
                 Ok(StreamRead::Data(Vec::new()))
             }
         }

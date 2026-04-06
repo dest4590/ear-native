@@ -19,6 +19,7 @@ pub enum Message {
     SetCustomEQLevel(usize, i8),
     LoadingTick,
     InitialDataLoadTimedOut,
+    IdentificationTimeout,
     ConfigLoaded(AppConfig),
     ConfigPersisted(Result<(), String>),
     SetANC(u8),
