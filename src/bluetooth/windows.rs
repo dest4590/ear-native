@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::fmt;
 use tokio::sync::mpsc;
 use windows::{
     core::HSTRING,
@@ -14,6 +15,17 @@ use super::{
     BluetoothAdapter, BluetoothEvent, BluetoothResult, BluetoothStream, DiscoveredDevice,
     StreamRead,
 };
+
+#[derive(Debug)]
+struct BluetoothErrorWrapper(String);
+
+impl fmt::Display for BluetoothErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for BluetoothErrorWrapper {}
 
 pub async fn create_adapter() -> BluetoothResult<Box<dyn BluetoothAdapter>> {
     Ok(Box::new(WindowsBluetoothAdapter))
@@ -41,14 +53,52 @@ impl BluetoothAdapter for WindowsBluetoothAdapter {
 
     async fn connect(&self, id: &str) -> BluetoothResult<Box<dyn BluetoothStream>> {
         let device_id = HSTRING::from(id);
-        let device = BluetoothDevice::FromIdAsync(&device_id)?.await?;
-        let rfcomm_result = device.GetRfcommServicesAsync()?.await?;
+        let device = BluetoothDevice::FromIdAsync(&device_id)
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to find device: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?
+            .await
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Device not accessible: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+
+        let rfcomm_result = device
+            .GetRfcommServicesAsync()
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to query services: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?
+            .await
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to get RFCOMM services: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
         let service = {
-            let services = rfcomm_result.Services()?;
-            let service_count = services.Size()?;
+            let services = rfcomm_result.Services().map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to access services: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            let service_count = services.Size().map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to get service count: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
             if service_count == 0 {
-                return Err("No RFCOMM services found".into());
+                return Err("No RFCOMM services found on device".into());
             }
 
             let mut spp_service = None;
@@ -80,15 +130,64 @@ impl BluetoothAdapter for WindowsBluetoothAdapter {
                 .unwrap_or_else(|| services.GetAt(0).expect("rfcomm service at index 0"))
         };
 
-        let hostname = service.ConnectionHostName()?;
-        let service_name = service.ConnectionServiceName()?;
-        let socket = StreamSocket::new()?;
-        socket.ConnectAsync(&hostname, &service_name)?.await?;
+        let hostname = service.ConnectionHostName().map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to get connection hostname: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let service_name = service.ConnectionServiceName().map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to get service name: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
-        let output_stream = socket.OutputStream()?;
-        let input_stream = socket.InputStream()?;
-        let writer = DataWriter::CreateDataWriter(&output_stream)?;
-        let reader = DataReader::CreateDataReader(&input_stream)?;
+        let socket = StreamSocket::new().map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to create socket: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+        socket
+            .ConnectAsync(&hostname, &service_name)
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!(
+                    "Failed to connect to service: {}",
+                    e
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?
+            .await
+            .map_err(|e| {
+                Box::new(BluetoothErrorWrapper(format!("Connection failed: {}", e)))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
+
+        let output_stream = socket.OutputStream().map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to get output stream: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let input_stream = socket.InputStream().map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to get input stream: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let writer = DataWriter::CreateDataWriter(&output_stream).map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to create data writer: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let reader = DataReader::CreateDataReader(&input_stream).map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to create data reader: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
         let _ = reader.SetInputStreamOptions(InputStreamOptions::Partial);
 
         let read_rx = spawn_reader(reader);

@@ -4,6 +4,7 @@ use crate::{
     bluetooth::{BluetoothEvent, ManagerCommand},
     config::AppConfig,
     models::ModelInfo,
+    tray::TrayEvent,
     EarNative,
 };
 
@@ -11,6 +12,7 @@ use crate::{
 pub enum Message {
     ActiveModelAssetsPreloaded,
     Bluetooth(BluetoothEvent),
+    BluetoothInitializationFailed(String),
     Connect(String),
     Disconnect,
     IncCustomEQ(usize),
@@ -38,6 +40,10 @@ pub enum Message {
     ToggleLatency(bool),
     CommandSent,
     Ready(mpsc::Sender<ManagerCommand>),
+    WindowId(Option<iced::window::Id>),
+    CloseRequested(iced::window::Id),
+    Tray(TrayEvent),
+    BatteryRefreshTick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

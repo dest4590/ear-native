@@ -203,7 +203,7 @@ impl GestureAction {
             10 => Self::NoiseControl,
             18 => Self::VolumeUp,
             19 => Self::VolumeDown,
-            20 | 21 | 22 => Self::NoiseControlToggles(value),
+            20..=22 => Self::NoiseControlToggles(value),
             _ => Self::Unknown(value),
         }
     }

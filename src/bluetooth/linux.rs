@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bluer::{rfcomm, Adapter, AdapterEvent, Address};
 use futures::{pin_mut, StreamExt};
 use log::{info, warn};
+use std::fmt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -12,12 +13,39 @@ use super::{
     StreamRead,
 };
 
-pub async fn create_adapter() -> BluetoothResult<Box<dyn BluetoothAdapter>> {
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
+#[derive(Debug)]
+struct BluetoothErrorWrapper(String);
 
-    if !adapter.is_powered().await? {
-        adapter.set_powered(true).await?;
+impl fmt::Display for BluetoothErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for BluetoothErrorWrapper {}
+
+pub async fn create_adapter() -> BluetoothResult<Box<dyn BluetoothAdapter>> {
+    let session = bluer::Session::new().await.map_err(|e| {
+        Box::new(BluetoothErrorWrapper(format!(
+            "Failed to connect to BlueZ daemon: {} (is Bluetooth service running?)",
+            e
+        ))) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
+    let adapter = session.default_adapter().await.map_err(|e| {
+        Box::new(BluetoothErrorWrapper(format!(
+            "No Bluetooth adapter found: {} (is Bluetooth disabled?)",
+            e
+        ))) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
+    if !adapter.is_powered().await.unwrap_or(false) {
+        adapter.set_powered(true).await.map_err(|e| {
+            Box::new(BluetoothErrorWrapper(format!(
+                "Failed to enable Bluetooth adapter: {}",
+                e
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
     }
 
     Ok(Box::new(LinuxBluetoothAdapter { adapter }))

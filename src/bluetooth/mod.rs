@@ -195,6 +195,14 @@ fn drain_packets(buf: &mut BytesMut, mut emit: impl FnMut(Packet)) {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use linux::create_adapter;
+#[cfg(target_os = "windows")]
+pub use windows::create_adapter;
+
+#[cfg(target_os = "macos")]
+compile_error!("macOS is not yet supported. Please use Linux or Windows.");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,11 +223,3 @@ mod tests {
         assert_eq!(buffer.as_ref(), &packet[..6]);
     }
 }
-
-#[cfg(target_os = "linux")]
-pub use linux::create_adapter;
-#[cfg(target_os = "windows")]
-pub use windows::create_adapter;
-
-#[cfg(target_os = "macos")]
-compile_error!("macOS is not yet supported. Please use Linux or Windows.");

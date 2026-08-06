@@ -7,7 +7,7 @@
 
 https://github.com/user-attachments/assets/3bc42663-332d-465d-886e-3e60b27c935d
 
-Native Rust desktop client for Nothing and CMF audio devices. The app uses `iced` for the UI and includes platform-specific Bluetooth backends for Linux and Windows.
+Native Rust desktop client for Nothing and CMF audio devices.
 
 ## Platform Support
 
@@ -17,23 +17,38 @@ Native Rust desktop client for Nothing and CMF audio devices. The app uses `iced
 ## Requirements
 
 - Rust stable toolchain
-- Linux only:
-    - BlueZ
-    - D-Bus development headers if your distribution packages them separately, for example `libdbus-1-dev` on Debian/Ubuntu
-- Windows only:
-    - Windows 10 or Windows 11
-    - Devices should already be paired before launching the app, since the Windows backend enumerates paired devices
 
-## Build
+- Linux only:
+  - BlueZ
+  - D-Bus development headers if your distribution packages them separately, for example `libdbus-1-dev` on Debian/Ubuntu
+- Windows only:
+  - Windows 10 or Windows 11
+  - Devices should already be paired before launching the app, since the Windows backend enumerates paired devices
+
+## Installation
+
+### Arch Linux
+
+An AUR package is available via [`ear-native`](https://aur.archlinux.org/packages/ear-native). Install with:
 
 ```bash
-cargo build --release
+yay -S ear-native
+# or
+paru -S ear-native
+```
+
+### From Source
+
+```bash
+git clone https://github.com/dest4590/ear-native.git
+cd ear-native
+cargo build --release # or build in debug, cargo build
 ```
 
 ## Run
 
 ```bash
-cargo run
+cargo run --release # or run in debug, cargo run
 ```
 
 ## Current Functionality
@@ -52,7 +67,6 @@ cargo run
 - In-ear detection toggle
 - Low-latency mode toggle
 - Firmware version display
-- Reactive async Bluetooth I/O through background tasks
 
 ## Supported Models
 

@@ -45,8 +45,6 @@ fn action_button(
 
     if is_active {
         button.style(btn_style_active).into()
-    } else if is_pending {
-        button.style(btn_style_default).into()
     } else {
         button.style(btn_style_default).into()
     }
@@ -77,8 +75,6 @@ fn small_action_button(
 
     if is_active {
         button.style(btn_style_active).into()
-    } else if is_pending {
-        button.style(btn_style_default).into()
     } else {
         button.style(btn_style_default).into()
     }
