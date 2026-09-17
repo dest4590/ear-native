@@ -112,7 +112,7 @@ impl InitialDataLoad {
             anc: false,
             eq: false,
             personalized_anc: false,
-            in_ear: false,
+            in_ear: !EarNative::supports_in_ear(model),
             latency: false,
             enhanced_bass: false,
             custom_eq: model.base == "B181",

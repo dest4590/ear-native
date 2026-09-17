@@ -162,3 +162,21 @@ pub fn view(model: &ModelInfo, device: &ConnectedDevice) -> Element<'static, Mes
     .spacing(8)
     .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::get_models;
+
+    #[test]
+    fn b185_exposes_basic_anc_without_strength_or_personalization() {
+        let models = get_models();
+        let model = &models["hoothoot_generic"];
+        assert!(model.is_anc);
+        assert!(strength_options(model).is_empty());
+        assert!(!supports_personalized_anc(model));
+        assert_eq!(strength_options(&models["ear_2_black"]).len(), 4);
+        assert!(supports_personalized_anc(&models["ear_2_black"]));
+        assert!(strength_options(&models["donphan_black"]).is_empty());
+    }
+}

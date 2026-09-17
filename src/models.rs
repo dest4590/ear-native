@@ -343,6 +343,18 @@ pub fn get_models() -> HashMap<String, ModelInfo> {
         },
     );
     m.insert(
+        "hoothoot_generic".to_string(),
+        ModelInfo {
+            name: "CMF Buds 2a".to_string(),
+            base: "B185".to_string(),
+            left_img: "res/assets/donphan_black_left.webp".to_string(),
+            case_img: "res/assets/donphan_black_case.webp".to_string(),
+            right_img: "res/assets/donphan_black_right.webp".to_string(),
+            duo_img: "".to_string(),
+            is_anc: true,
+        },
+    );
+    m.insert(
         "espeon_black".to_string(),
         ModelInfo {
             name: "CMF Buds Pro 2".to_string(),

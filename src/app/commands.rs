@@ -58,11 +58,28 @@ impl EarNative {
         payload
     }
 
+    pub fn custom_eq_payload_for_model(
+        model: &crate::models::ModelInfo,
+        custom_eq: [f32; 3],
+    ) -> Vec<u8> {
+        if model.base != "B185" {
+            return Self::build_custom_eq_payload(custom_eq);
+        }
+
+        let mut payload = Self::build_custom_eq_payload([custom_eq[1], custom_eq[2], custom_eq[0]]);
+        let highest = custom_eq.into_iter().fold(0.0f32, f32::max);
+        payload[1..5].copy_from_slice(&Self::format_float_for_eq(-highest, true));
+        payload[14..18].copy_from_slice(&0.7f32.to_le_bytes());
+        payload[23..27].copy_from_slice(&6900.0f32.to_le_bytes());
+        payload
+    }
+
     pub fn send_custom_eq_commands(&mut self, custom_eq: [f32; 3]) -> Task<Message> {
-        self.send_command(
-            PacketCommand::SetCustomEq,
-            EarNative::build_custom_eq_payload(custom_eq),
-        )
+        let Some(device) = &self.connected_device else {
+            return Task::none();
+        };
+        let payload = Self::custom_eq_payload_for_model(&device.model, custom_eq);
+        self.send_command(PacketCommand::SetCustomEq, payload)
     }
 
     pub fn start_initial_data_load(&mut self, model: crate::models::ModelInfo) -> Task<Message> {
@@ -86,7 +103,7 @@ impl EarNative {
             self.send_delayed_command(PacketCommand::ReadBattery, vec![], 100),
             self.send_delayed_command(PacketCommand::ReadAnc, vec![], 300),
             self.send_delayed_command(
-                if model.base == "B172" || model.base == "B168" {
+                if EarNative::eq_command_for_model(&model) == PacketCommand::SetListeningMode {
                     PacketCommand::ReadListeningMode
                 } else {
                     PacketCommand::ReadEq
@@ -99,10 +116,16 @@ impl EarNative {
             } else {
                 Task::none()
             },
-            self.send_delayed_command(PacketCommand::ReadInEar, vec![], 700),
+            if EarNative::supports_in_ear(&model) {
+                self.send_delayed_command(PacketCommand::ReadInEar, vec![], 700)
+            } else {
+                Task::none()
+            },
             self.send_delayed_command(PacketCommand::ReadLatency, vec![], 900),
             self.send_delayed_command(PacketCommand::ReadEnhancedBass, vec![], 1100),
-            if EarNative::supports_custom_eq(&model) {
+            if EarNative::supports_custom_eq(&model)
+                && EarNative::supports_command(&model, PacketCommand::ReadAdvancedEq)
+            {
                 self.send_delayed_command(PacketCommand::ReadAdvancedEq, vec![], 1300)
             } else {
                 Task::none()
@@ -136,6 +159,12 @@ impl EarNative {
         payload: Vec<u8>,
         delay_ms: u64,
     ) -> Task<Message> {
+        if let Some(device) = &self.connected_device {
+            if !EarNative::supports_command(&device.model, command) {
+                return Task::none();
+            }
+        }
+
         self.operation_id = self.operation_id.wrapping_add(1);
         let packet = Packet::new(command, payload.clone(), self.operation_id);
         if let Some(tx) = &self.cmd_tx {
@@ -312,5 +341,46 @@ impl EarNative {
         }
 
         Subscription::batch(subs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{models::get_models, protocol::ParsedResponse};
+
+    #[test]
+    fn b185_custom_eq_uses_reference_band_order_and_parameters() {
+        let models = get_models();
+        let model = &models["hoothoot_generic"];
+        let values = [3.0, -2.0, 1.0];
+        let payload = EarNative::custom_eq_payload_for_model(model, values);
+        assert_eq!(payload.len(), 53);
+        assert_eq!(payload[0], 3);
+        assert_eq!(&payload[1..5], &(-3.0f32).to_le_bytes());
+        for (index, (filter, gain, frequency, quality)) in [
+            (1, -2.0f32, 980.0f32, 0.7f32),
+            (2, 1.0f32, 6900.0f32, 1.0f32),
+            (0, 3.0f32, 140.0f32, 0.8f32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = 5 + index * 13;
+            assert_eq!(payload[offset], filter);
+            assert_eq!(&payload[offset + 1..offset + 5], &gain.to_le_bytes());
+            assert_eq!(&payload[offset + 5..offset + 9], &frequency.to_le_bytes());
+            assert_eq!(&payload[offset + 9..offset + 13], &quality.to_le_bytes());
+        }
+        let response = Packet::new(PacketCommand::RespCustomEq, payload, 0);
+        assert!(matches!(response.parse(), ParsedResponse::CustomEq(read) if read == values));
+        let negative = EarNative::custom_eq_payload_for_model(model, [-3.0, -2.0, -1.0]);
+        assert_eq!(&negative[1..5], &[0, 0, 0, 0x80]);
+        for model in models.values().filter(|model| model.base != "B185") {
+            assert_eq!(
+                EarNative::custom_eq_payload_for_model(model, values),
+                EarNative::build_custom_eq_payload(values)
+            );
+        }
     }
 }

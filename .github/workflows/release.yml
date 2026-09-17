@@ -4,10 +4,19 @@ on:
     push:
         tags:
             - 'v*'
-    workflow_dispatch: {}
+    workflow_dispatch:
+        inputs:
+            windows_only:
+                description: Build only the Windows executable
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
 
 jobs:
     build-linux:
+        if: github.event_name != 'workflow_dispatch' || !inputs.windows_only
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
@@ -82,21 +91,33 @@ jobs:
 
     build-windows:
         runs-on: windows-latest
+        timeout-minutes: 60
         steps:
             - uses: actions/checkout@v4
 
             - name: Set up Rust
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
-                  profile: minimal
-                  override: true
+              run: |
+                  rustup toolchain install stable --profile minimal
+                  rustup default stable
+
+            - name: Check all targets
+              run: cargo check --locked --all-targets
+
+            - name: Test B185 support
+              run: cargo test --locked b185
+
+            - name: Test model name matching
+              run: cargo test --locked name_matching_prefers_exact_and_longest_names_deterministically
+
+            - name: Test cached model variants
+              run: cargo test --locked other_models_keep_cached_variants
 
             - name: Build release (MSVC)
-              run: cargo build --release
+              run: cargo build --release --locked
 
             - name: Upload Windows exe
               uses: actions/upload-artifact@v4
               with:
                   name: windows-artifact
                   path: target/release/ear-native.exe
+                  if-no-files-found: error

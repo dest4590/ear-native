@@ -54,6 +54,15 @@ fn supports_advanced_eq(model: &ModelInfo) -> bool {
 
 fn eq_presets(model: &ModelInfo) -> &'static [(u8, &'static str)] {
     match model.base.as_str() {
+        "B185" => &[
+            (7, "dirac"),
+            (3, "pop"),
+            (1, "rock"),
+            (5, "classical"),
+            (2, "electronic"),
+            (4, "enhance vocals"),
+            (6, "custom"),
+        ],
         "B172" | "B168" => &[
             (0, "dirac opteo"),
             (3, "pop"),
@@ -87,6 +96,7 @@ fn eq_button_active(
     eq_preset: u8,
     advanced_eq_enabled: bool,
 ) -> bool {
+    let advanced_eq_enabled = advanced_eq_enabled && model.base != "B185";
     if supports_advanced_eq(model) && preset == 6 {
         advanced_eq_enabled
     } else {
@@ -95,7 +105,7 @@ fn eq_button_active(
 }
 
 fn custom_eq_active(model: &ModelInfo, eq_preset: u8, advanced_eq_enabled: bool) -> bool {
-    if matches!(model.base.as_str(), "B172" | "B168") {
+    if matches!(model.base.as_str(), "B172" | "B168" | "B185") {
         eq_preset == 6
     } else {
         eq_preset == 5 && !advanced_eq_enabled
@@ -314,9 +324,58 @@ pub fn view(model: &ModelInfo, device: &ConnectedDevice) -> Element<'static, Mes
         content = content.push(custom_eq_view(model, device));
     }
 
-    if device.advanced_eq_enabled {
+    if model.base != "B185" && device.advanced_eq_enabled {
         content = content.push(advanced_eq_view());
     }
 
     content.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        models::get_models,
+        protocol::{Packet, PacketCommand, ParsedResponse},
+        EarNative,
+    };
+
+    #[test]
+    fn b185_presets_use_exact_listening_mode_ids() {
+        let models = get_models();
+        let model = &models["hoothoot_generic"];
+        assert_eq!(
+            eq_presets(model),
+            &[
+                (7, "dirac"),
+                (3, "pop"),
+                (1, "rock"),
+                (5, "classical"),
+                (2, "electronic"),
+                (4, "enhance vocals"),
+                (6, "custom"),
+            ]
+        );
+        for &(preset, _) in eq_presets(model) {
+            let bytes =
+                Packet::new(EarNative::eq_command_for_model(model), vec![preset, 0], 1).to_bytes();
+            assert_eq!(&bytes[3..5], &61469u16.to_le_bytes());
+            assert_eq!(&bytes[8..10], &[preset, 0]);
+            let response = Packet::new(PacketCommand::RespEqAlt, vec![preset], 1);
+            assert!(
+                matches!(response.parse(), ParsedResponse::Eq { preset: raw, .. } if raw == preset)
+            );
+            assert!(eq_button_active(model, preset, preset, false));
+            assert!(eq_button_active(model, preset, preset, true));
+        }
+        assert!(custom_eq_active(model, 6, false));
+        assert!(!custom_eq_active(model, 5, false));
+        assert!(!supports_advanced_eq(model));
+        for key in ["donphan_black", "espeon_black"] {
+            assert_eq!(eq_presets(&models[key])[0], (0, "dirac opteo"));
+            assert!(custom_eq_active(&models[key], 6, false));
+        }
+        assert!(custom_eq_active(&models["ear_2_black"], 5, false));
+        assert!(supports_advanced_eq(&models["ear_2_black"]));
+    }
 }

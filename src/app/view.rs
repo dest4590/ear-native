@@ -385,15 +385,19 @@ impl EarNative {
 
                     let settings_ui = column![
                         section_title("settings"),
-                        make_btn(
-                            if device.in_ear_enabled {
-                                "in-ear detect [ on ]"
-                            } else {
-                                "in-ear detect [ off ]"
-                            },
-                            device.in_ear_enabled,
-                            Message::ToggleInEar(!device.in_ear_enabled)
-                        ),
+                        if EarNative::supports_in_ear(model) {
+                            column![make_btn(
+                                if device.in_ear_enabled {
+                                    "in-ear detect [ on ]"
+                                } else {
+                                    "in-ear detect [ off ]"
+                                },
+                                device.in_ear_enabled,
+                                Message::ToggleInEar(!device.in_ear_enabled)
+                            )]
+                        } else {
+                            column![]
+                        },
                         make_btn(
                             if device.latency_low {
                                 "low latency [ on ]"
@@ -439,6 +443,14 @@ impl EarNative {
                                 .width(Length::Fill)
                                 .align_x(Alignment::Center),
                             device_images,
+                            if model.base == "B185" {
+                                column![text("placeholder images: CMF Buds")
+                                    .font(app_font())
+                                    .size(12)
+                                    .color(GREY)]
+                            } else {
+                                column![]
+                            },
                             battery_info,
                             if model.is_anc {
                                 anc_ui

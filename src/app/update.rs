@@ -99,8 +99,21 @@ impl EarNative {
                     self.initial_data_load = None;
                     self.loading_frame = 0;
 
+                    let resolved_model_key = self.connection_model_key(&name, &addr);
+                    let mut config_changed = false;
+                    if let Some(key) = &resolved_model_key {
+                        if self.models[key].base == "B185" {
+                            config_changed = self.config.remember_device_metadata(
+                                &addr,
+                                Some(&name),
+                                Some(key),
+                                None,
+                            );
+                        }
+                    }
+
                     let mut tasks = Vec::new();
-                    if self.config.remember_connected_device(&addr) {
+                    if self.config.remember_connected_device(&addr) || config_changed {
                         log::debug!("Persisting config for connected device");
                         tasks.push(self.persist_config());
                     }
@@ -134,10 +147,10 @@ impl EarNative {
                         ear_tip_test_running: false,
                     });
 
-                    if let Some(cached_model_key) = self.config.known_model_key(&addr) {
-                        if let Some(cached_model) = self.models.get(cached_model_key).cloned() {
+                    if let Some(model_key) = resolved_model_key {
+                        if let Some(cached_model) = self.models.get(&model_key).cloned() {
                             log::info!(
-                                "Using cached model for {}: {} ({})",
+                                "Using resolved model for {}: {} ({})",
                                 addr,
                                 cached_model.name,
                                 cached_model.base
@@ -198,6 +211,9 @@ impl EarNative {
             }
             Message::SetANC(l) => {
                 if let Some(d) = &mut self.connected_device {
+                    if d.model.base == "B185" && !matches!(l, 1 | 2 | 4) {
+                        return Task::none();
+                    }
                     if d.anc_status == l {
                         return Task::none();
                     }
@@ -343,6 +359,9 @@ impl EarNative {
             }
             Message::ToggleInEar(e) => {
                 if let Some(d) = &mut self.connected_device {
+                    if !EarNative::supports_in_ear(&d.model) {
+                        return Task::none();
+                    }
                     d.in_ear_enabled = e;
                     return self.send_command(
                         PacketCommand::SetInEar,
@@ -353,10 +372,8 @@ impl EarNative {
             Message::ToggleLatency(e) => {
                 if let Some(d) = &mut self.connected_device {
                     d.latency_low = e;
-                    return self.send_command(
-                        PacketCommand::SetLatency,
-                        vec![if e { 0x01 } else { 0x00 }, 0x00],
-                    );
+                    let payload = EarNative::latency_payload(&d.model, e);
+                    return self.send_command(PacketCommand::SetLatency, payload);
                 }
             }
             Message::IncCustomEQ(i) => return self.custom_eq_delta(i, 1.0),
@@ -368,7 +385,7 @@ impl EarNative {
                     if i < 3 && EarNative::supports_custom_eq(&d.model) {
                         d.custom_eq[i] = (level as f32).clamp(-6.0, 6.0);
                         d.eq_mode = EqMode::Custom;
-                        d.eq_preset = if matches!(d.model.base.as_str(), "B172" | "B168") {
+                        d.eq_preset = if matches!(d.model.base.as_str(), "B172" | "B168" | "B185") {
                             6
                         } else {
                             5
@@ -429,7 +446,7 @@ impl EarNative {
             if i < 3 && delta != 0.0 && EarNative::supports_custom_eq(&d.model) {
                 d.custom_eq[i] = (d.custom_eq[i] + delta).clamp(-6.0, 6.0);
                 d.eq_mode = EqMode::Custom;
-                d.eq_preset = if matches!(d.model.base.as_str(), "B172" | "B168") {
+                d.eq_preset = if matches!(d.model.base.as_str(), "B172" | "B168" | "B185") {
                     6
                 } else {
                     5
@@ -553,7 +570,9 @@ impl EarNative {
                     self.mark_initial_data_loaded(|load| load.personalized_anc = true);
                 }
                 ParsedResponse::AdvancedEq(enabled) => {
-                    device.advanced_eq_enabled = enabled;
+                    if device.model.base != "B185" {
+                        device.advanced_eq_enabled = enabled;
+                    }
                 }
                 ParsedResponse::Firmware(s) => {
                     device.firmware_version = s.trim_matches(char::from(0)).trim().to_lowercase();
@@ -578,7 +597,11 @@ impl EarNative {
                     self.mark_initial_data_loaded(|load| load.in_ear = true);
                 }
                 ParsedResponse::Latency(b) => {
-                    device.latency_low = b;
+                    device.latency_low = if device.model.base == "B185" {
+                        packet.payload.first() == Some(&1)
+                    } else {
+                        b
+                    };
                     log::info!("Parsed latency mode status: {}", device.latency_low);
                     self.mark_initial_data_loaded(|load| load.latency = true);
                 }
@@ -608,5 +631,118 @@ impl EarNative {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Packet;
+
+    fn connected_app(name: &str, cached_key: Option<&str>) -> EarNative {
+        let mut app = EarNative::default();
+        app.discovered_devices
+            .push(("test-device".to_string(), name.to_string()));
+        if let Some(key) = cached_key {
+            app.config
+                .remember_device_metadata("test-device", Some(name), Some(key), None);
+        }
+        let _ = app.update(Message::Bluetooth(BluetoothEvent::Connected(
+            "test-device".to_string(),
+        )));
+        app
+    }
+
+    #[test]
+    fn b185_connection_corrects_and_persists_each_stale_b168_variant() {
+        for key in ["donphan_black", "donphan_white", "donphan_orange"] {
+            let app = connected_app("CMF Buds 2a", Some(key));
+            assert_eq!(
+                app.config.known_model_key("test-device"),
+                Some("hoothoot_generic")
+            );
+            assert_eq!(app.connected_device.as_ref().unwrap().model.base, "B185");
+            assert!(matches!(&app.state, AppState::Connected(model) if model.base == "B185"));
+            assert!(app.initial_data_load.as_ref().unwrap().in_ear);
+            let json = serde_json::to_string(&app.config).unwrap();
+            let restored: crate::config::AppConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                restored.known_model_key("test-device"),
+                Some("hoothoot_generic")
+            );
+        }
+        let app = connected_app("CMF Buds 2a", None);
+        assert_eq!(
+            app.config.known_model_key("test-device"),
+            Some("hoothoot_generic")
+        );
+    }
+
+    #[test]
+    fn other_models_keep_cached_variants() {
+        for (name, key) in [
+            ("CMF Buds", "donphan_orange"),
+            ("CMF Buds Pro 2", "espeon_white"),
+            ("Nothing Ear (2)", "ear_2_white"),
+        ] {
+            let app = connected_app(name, Some(key));
+            assert_eq!(app.config.known_model_key("test-device"), Some(key));
+            assert_eq!(
+                app.connected_device.as_ref().unwrap().model.left_img,
+                app.models[key].left_img
+            );
+        }
+    }
+
+    #[test]
+    fn b185_rejects_unsupported_updates_and_commands() {
+        let mut app = connected_app("CMF Buds 2a", None);
+        let before = app.operation_id;
+        let in_ear = app.connected_device.as_ref().unwrap().in_ear_enabled;
+        for message in [
+            Message::ToggleInEar(!in_ear),
+            Message::ToggleAdvancedEQ(true),
+            Message::SetPersonalizedANC(true),
+            Message::StartEarTipTest,
+            Message::SetANC(3),
+            Message::SetANC(5),
+            Message::SetANC(6),
+        ] {
+            let _ = app.update(message);
+        }
+        for command in [
+            PacketCommand::ReadInEar,
+            PacketCommand::SetInEar,
+            PacketCommand::ReadAdvancedEq,
+            PacketCommand::SetAdvancedEqEnabled,
+        ] {
+            let _ = app.send_command(command, vec![]);
+        }
+        assert_eq!(app.operation_id, before);
+        assert_eq!(
+            app.connected_device.as_ref().unwrap().in_ear_enabled,
+            in_ear
+        );
+        let _ = app.handle_packet(Packet::new(PacketCommand::RespAdvancedEqStatus, vec![1], 0));
+        assert!(!app.connected_device.as_ref().unwrap().advanced_eq_enabled);
+    }
+
+    #[test]
+    fn b185_eq_and_latency_updates_preserve_wire_values() {
+        let mut app = connected_app("CMF Buds 2a", None);
+        for preset in [7, 3, 1, 5, 2, 4, 6] {
+            let before = app.operation_id;
+            let _ = app.update(Message::SetEQ(preset));
+            assert_eq!(app.operation_id, before + 1);
+            assert_eq!(app.connected_device.as_ref().unwrap().eq_preset, preset);
+        }
+        let _ = app.update(Message::SetCustomEQLevel(0, 3));
+        assert_eq!(app.connected_device.as_ref().unwrap().eq_preset, 6);
+        let _ = app.update(Message::IncCustomEQ(1));
+        assert_eq!(app.connected_device.as_ref().unwrap().eq_preset, 6);
+        for (raw, expected) in [(1, true), (2, false), (0, false)] {
+            let _ = app.handle_packet(Packet::new(PacketCommand::RespLatency, vec![raw], 0));
+            assert_eq!(app.connected_device.as_ref().unwrap().latency_low, expected);
+        }
     }
 }
