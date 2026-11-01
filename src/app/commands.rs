@@ -217,7 +217,6 @@ impl EarNative {
                 |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
                     let (tx, mut rx) = mpsc::channel(100);
                     let (cmd_tx, cmd_rx) = mpsc::channel(100);
-                    let _ = output.send(Message::Ready(cmd_tx)).await;
 
                     let mut retry_count = 0;
                     let max_retries_before_notify = 3;
@@ -227,6 +226,7 @@ impl EarNative {
                         match create_adapter().await {
                             Ok(adapter) => {
                                 log::info!("Bluetooth adapter initialized successfully");
+                                let _ = output.send(Message::Ready(cmd_tx)).await;
                                 break BluetoothManager::new(adapter, tx.clone(), cmd_rx);
                             }
                             Err(error) => {

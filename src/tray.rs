@@ -92,7 +92,7 @@ fn run_tray(tx: std::sync::mpsc::Sender<TrayEvent>) {
     let batt_case = menu.battery_case.clone();
     let batt_right = menu.battery_right.clone();
 
-    match TrayIconBuilder::new()
+    let _tray = match TrayIconBuilder::new()
         .with_tooltip("ear (native)")
         .with_menu(Box::new(menu.menu))
         .with_icon(icon)
@@ -100,13 +100,13 @@ fn run_tray(tx: std::sync::mpsc::Sender<TrayEvent>) {
     {
         Ok(tray) => {
             log::info!("tray icon created successfully");
-            std::mem::forget(tray);
+            tray
         }
         Err(error) => {
             log::warn!("failed to create tray icon: {}", error);
             return;
         }
-    }
+    };
 
     let (battery_tx, mut battery_rx) = tokio::sync::mpsc::channel::<(String, String, String)>(8);
     let _ = BATTERY_TX.set(battery_tx);
@@ -126,6 +126,25 @@ fn run_tray(tx: std::sync::mpsc::Sender<TrayEvent>) {
             }
             ControlFlow::Continue
         });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let bl = batt_left.clone();
+        let bc = batt_case.clone();
+        let br = batt_right.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("tray-battery-windows".to_string())
+            .spawn(move || {
+                while let Some((l, c, r)) = battery_rx.blocking_recv() {
+                    bl.set_text(&l);
+                    bc.set_text(&c);
+                    br.set_text(&r);
+                }
+            })
+        {
+            log::warn!("failed to spawn windows tray battery thread: {}", e);
+        }
     }
 
     let menu_tx = tx.clone();
@@ -150,6 +169,7 @@ fn run_tray(tx: std::sync::mpsc::Sender<TrayEvent>) {
     }));
 
     run_loop();
+    drop(_tray);
 }
 
 struct TrayMenuBuilder {

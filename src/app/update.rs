@@ -43,7 +43,7 @@ impl EarNative {
                         name
                     );
                     let model_key = self.inferred_model_key(name);
-                    let model = self.models.get(&model_key).unwrap().clone();
+                    let model = self.get_model_or_default(&model_key);
                     return self.start_initial_data_load(model);
                 }
             }
@@ -61,6 +61,7 @@ impl EarNative {
                         self.discovered_devices
                             .push((device.id.clone(), device.name.clone()));
                     }
+                    self.sort_discovered_devices();
 
                     if self.config.remember_device_name(&device.id, &device.name) {
                         tasks.push(self.persist_config());
@@ -106,7 +107,7 @@ impl EarNative {
                     }
 
                     let initial_model_key = self.inferred_model_key(&name);
-                    let initial_model = self.models.get(&initial_model_key).unwrap().clone();
+                    let initial_model = self.get_model_or_default(&initial_model_key);
                     log::debug!("Inferred model: {}", initial_model.name);
 
                     self.connected_device = Some(ConnectedDevice {
@@ -281,32 +282,34 @@ impl EarNative {
                 self.pending_confirmation = Some(PendingConfirmation::StartRing(target));
             }
             Message::StopRing(target) => {
-                let mut request = None;
+                let mut payloads = Vec::new();
                 if let Some(d) = &mut self.connected_device {
                     EarNative::set_ringing_state(d, target, false);
-                    request = Some((
-                        PacketCommand::SetRingBuds,
-                        EarNative::ring_buds_payload(&d.model, target, false),
-                    ));
+                    payloads = EarNative::ring_buds_payloads(&d.model, target, false);
                 }
-                if let Some((command, payload)) = request {
-                    return self.send_command(command, payload);
+                if !payloads.is_empty() {
+                    return Task::batch(
+                        payloads
+                            .into_iter()
+                            .map(|payload| self.send_command(PacketCommand::SetRingBuds, payload)),
+                    );
                 }
             }
             Message::ConfirmPendingAction => {
                 if let Some(PendingConfirmation::StartRing(target)) =
                     self.pending_confirmation.take()
                 {
-                    let mut request = None;
+                    let mut payloads = Vec::new();
                     if let Some(d) = &mut self.connected_device {
                         EarNative::set_ringing_state(d, target, true);
-                        request = Some((
-                            PacketCommand::SetRingBuds,
-                            EarNative::ring_buds_payload(&d.model, target, true),
-                        ));
+                        payloads = EarNative::ring_buds_payloads(&d.model, target, true);
                     }
-                    if let Some((command, payload)) = request {
-                        return self.send_command(command, payload);
+                    if !payloads.is_empty() {
+                        return Task::batch(
+                            payloads
+                                .into_iter()
+                                .map(|payload| self.send_command(PacketCommand::SetRingBuds, payload)),
+                        );
                     }
                 }
             }
@@ -477,7 +480,7 @@ impl EarNative {
                     .cloned()
                     .unwrap_or_else(|| self.inferred_model_key(name));
 
-                let model = self.models.get(&model_key).unwrap().clone();
+                let model = self.get_model_or_default(&model_key);
                 log::info!(
                     "Identified model: {} ({}) via SKU: {}",
                     model.name,
@@ -562,7 +565,7 @@ impl EarNative {
                         log::info!("Identifying via Firmware fallback for: {}", name);
                         let model_key = self.inferred_model_key(name);
 
-                        let model = self.models.get(&model_key).unwrap().clone();
+                        let model = self.get_model_or_default(&model_key);
                         log::info!(
                             "Identified model via fallback: {} ({})",
                             model.name,

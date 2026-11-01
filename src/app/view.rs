@@ -38,24 +38,7 @@ impl EarNative {
                             .color(GREY),
                     );
                 } else {
-                    let mut devices: Vec<_> = self.discovered_devices.iter().collect();
-                    devices.sort_by(|(addr_a, name_a), (addr_b, name_b)| {
-                        let matched_a = self.matched_model_name(name_a);
-                        let matched_b = self.matched_model_name(name_b);
-                        let model_a = matched_a.unwrap_or(name_a.as_str()).to_lowercase();
-                        let model_b = matched_b.unwrap_or(name_b.as_str()).to_lowercase();
-                        let raw_a = name_a.to_lowercase();
-                        let raw_b = name_b.to_lowercase();
-
-                        matched_a
-                            .is_none()
-                            .cmp(&matched_b.is_none())
-                            .then_with(|| model_a.cmp(&model_b))
-                            .then_with(|| raw_a.cmp(&raw_b))
-                            .then_with(|| addr_a.cmp(addr_b))
-                    });
-
-                    for (addr, name) in devices {
+                    for (addr, name) in &self.discovered_devices {
                         list = list.push(
                             button(
                                 text(name.to_lowercase())

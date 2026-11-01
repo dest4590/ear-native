@@ -5,31 +5,24 @@ edition = "2021"
 
 [dependencies]
 iced = { version = "0.14.0", features = ["image", "svg", "tokio"] }
-rust-embed = { version = "8.12.0", features = ["include-flate"] }
-tokio = { version = "1.53.1", features = ["full"] }
+rust-embed = { version = "8.13.0", features = ["include-flate"] }
+tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 crc = "3.4.0"
-log = "0.4.33"
+log = "0.4.35"
 env_logger = "0.11.11"
 bytes = "1.12.1"
-futures = "0.3.33"
-uuid = { version = "1.24.0", features = ["v4"] }
+futures = "0.3.34"
 image = "0.25.10"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 directories = "6.0.0"
-resvg = "0.48.1"
-tiny-skia = "0.12.0"
-usvg = "0.48.1"
 iced_futures = "0.14.0"
-webp = "0.3.1"
 num_enum = "0.7.6"
 tray-icon = "0.24"
 
-
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17.4", features = ["full"] }
-notify-rust = "4.18.0"
 gtk = "0.18"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -44,4 +37,3 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
-win32_notif = "0.15.3"

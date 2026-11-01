@@ -132,3 +132,34 @@ impl InitialDataLoad {
             && (!self.require_anc || self.anc)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_data_load_completes_when_all_required_fields_set() {
+        let model = ModelInfo {
+            name: "Ear (1)".to_string(),
+            base: "B181".to_string(),
+            left_img: String::new(),
+            case_img: String::new(),
+            right_img: String::new(),
+            duo_img: String::new(),
+            is_anc: true,
+        };
+
+        let mut load = InitialDataLoad::for_model(&model);
+        assert!(!load.is_complete());
+
+        load.battery = true;
+        load.eq = true;
+        load.in_ear = true;
+        load.latency = true;
+        load.enhanced_bass = true;
+        assert!(!load.is_complete());
+
+        load.anc = true;
+        assert!(load.is_complete());
+    }
+}

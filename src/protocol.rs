@@ -216,8 +216,10 @@ pub struct Gesture {
     pub action: GestureAction,
 }
 
+pub const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_ARC);
+
 pub fn calculate_crc(data: &[u8]) -> u16 {
-    Crc::<u16>::new(&CRC_16_ARC).checksum(data)
+    CRC.checksum(data)
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +247,11 @@ impl Packet {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        assert!(
+            self.payload.len() <= u8::MAX as usize,
+            "Packet payload length ({}) exceeds 255 bytes limit",
+            self.payload.len()
+        );
         let mut data = vec![
             Self::FRAME_MARKER,
             0x60,
@@ -284,11 +291,12 @@ impl Packet {
             u16::from_le_bytes(frame.get(total_len - 2..total_len)?.try_into().ok()?);
         let crc_calculated = calculate_crc(frame.get(..total_len - Self::TRAILER_LEN)?);
         if crc_calculated != crc_received {
-            log::trace!(
-                "BT packet CRC mismatch: calculated 0x{:04x}, received 0x{:04x} (accepted anyway)",
+            log::debug!(
+                "BT packet CRC mismatch: calculated 0x{:04x}, received 0x{:04x}",
                 crc_calculated,
                 crc_received
             );
+            return None;
         }
 
         let raw_cmd = u16::from_le_bytes([*frame.get(3)?, *frame.get(4)?]);
@@ -333,9 +341,11 @@ impl Packet {
                     .payload
                     .get(1..)
                     .unwrap_or(&[])
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .copied()
                     .take(count)
-                    .map(|chunk| [chunk[0], chunk[1]])
                 {
                     let stat = BatteryStatus {
                         level: status & 0x7F,
@@ -392,7 +402,9 @@ impl Packet {
                     .payload
                     .get(1..)
                     .unwrap_or(&[])
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(count)
                 {
                     if let (Some(d), Some(t)) =
@@ -508,5 +520,94 @@ mod tests {
         encoded[last_index] ^= 0xFF;
 
         assert!(Packet::from_bytes(&encoded).is_none());
+    }
+
+    #[test]
+    fn parse_battery_response() {
+        let payload = vec![3, 2, 85 | 0x80, 3, 90, 4, 50];
+        let packet = Packet::new(PacketCommand::RespBattery, payload, 1);
+        match packet.parse() {
+            ParsedResponse::Battery(bat) => {
+                let left = bat.left.unwrap();
+                assert_eq!(left.level, 85);
+                assert!(left.is_charging);
+
+                let right = bat.right.unwrap();
+                assert_eq!(right.level, 90);
+                assert!(!right.is_charging);
+
+                let case = bat.case.unwrap();
+                assert_eq!(case.level, 50);
+                assert!(!case.is_charging);
+            }
+            other => panic!("expected battery response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_anc_response() {
+        let payload = vec![0, AncMode::NcHigh as u8];
+        let packet = Packet::new(PacketCommand::RespAnc, payload, 1);
+        match packet.parse() {
+            ParsedResponse::Anc(mode) => assert_eq!(mode, AncMode::NcHigh),
+            other => panic!("expected Anc, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_eq_response() {
+        let payload = vec![EqMode::MoreBass as u8];
+        let packet = Packet::new(PacketCommand::RespEq, payload, 1);
+        match packet.parse() {
+            ParsedResponse::Eq { mode, preset } => {
+                assert_eq!(mode, EqMode::MoreBass);
+                assert_eq!(preset, EqMode::MoreBass as u8);
+            }
+            other => panic!("expected Eq, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_in_ear_and_latency_responses() {
+        let in_ear_packet = Packet::new(PacketCommand::RespInEar, vec![0, 0, 1], 1);
+        match in_ear_packet.parse() {
+            ParsedResponse::InEar(enabled) => assert!(enabled),
+            other => panic!("expected InEar, got {:?}", other),
+        }
+
+        let latency_packet = Packet::new(PacketCommand::RespLatency, vec![1], 1);
+        match latency_packet.parse() {
+            ParsedResponse::Latency(enabled) => assert!(enabled),
+            other => panic!("expected Latency, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_sku_response() {
+        let payload = vec![0x00, 0x31];
+        let packet = Packet::new(PacketCommand::RespSku, payload, 1);
+        match packet.parse() {
+            ParsedResponse::Sku(sku) => assert_eq!(sku, "31"),
+            other => panic!("expected Sku, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_firmware_response() {
+        let fw_bytes = b"1.0.1.55".to_vec();
+        let packet = Packet::new(PacketCommand::RespFirmware, fw_bytes, 1);
+        match packet.parse() {
+            ParsedResponse::Firmware(fw) => assert_eq!(fw, "1.0.1.55"),
+            other => panic!("expected Firmware, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eq_float_roundtrip() {
+        for val in [-6.0f32, -4.0, -1.0, 0.0, 1.0, 3.5, 6.0] {
+            let encoded = crate::EarNative::format_float_for_eq(val, false);
+            let decoded = from_format_float_for_eq(encoded);
+            assert_eq!(val, decoded);
+        }
     }
 }
